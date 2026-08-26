@@ -1,0 +1,5 @@
+# 本地状态与备份，不进仓库
+*.bak.*
+_async.log
+_tasktest.log
+*.png

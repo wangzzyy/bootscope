@@ -1,0 +1,10 @@
+# 这个项目的文件编码是硬约束，不能让 Git 的换行/编码转换动它们：
+#   .ps1  必须是 UTF-8 with BOM —— Windows PowerShell 5.1 没有 BOM 会把中文读成乱码
+#   .vbs  必须是 UTF-16 LE      —— WSH 不认 UTF-8，存错了直接报「无效字符」
+# 把 .vbs 标成 binary，Git 就不会对它做任何行尾替换（对 UTF-16 做替换会插入
+# 孤立的 0x0D 字节，文件当场损坏）。
+*.vbs  binary
+*.ps1  text eol=crlf
+*.md   text eol=lf
+*.gitattributes text eol=lf
+*.gitignore     text eol=lf
