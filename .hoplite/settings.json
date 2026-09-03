@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "ports": {"preview": 3000, "additional": {}},
+  "scripts": {
+    "setup": {
+      "enabled": true,
+      "command": "set -e; if ! command -v git-lfs >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then apt-get install -y --no-install-recommends git-lfs >/dev/null 2>&1 || true; fi; fi; if ! command -v git-lfs >/dev/null 2>&1; then curl -fsSL --max-time 180 -o /tmp/gitlfs.tar.gz https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz && tar -xzf /tmp/gitlfs.tar.gz -C /tmp && install -m 755 /tmp/git-lfs-3.5.1/git-lfs /usr/local/bin/git-lfs && rm -f /tmp/gitlfs.tar.gz; fi; if command -v git-lfs >/dev/null 2>&1; then git lfs install --skip-smudge >/dev/null 2>&1 || true; fi"
+    },
+    "run": {"enabled": true, "command": null},
+    "archive": {"enabled": true, "command": null},
+    "check": {"enabled": true, "command": null}
+  },
+  "mcpServers": []
+}
