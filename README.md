@@ -274,6 +274,7 @@ pwsh -STA -ExecutionPolicy Bypass -File _selftest.ps1             # CRUD 链路
 pwsh -STA -ExecutionPolicy Bypass -File _selftest_batch.ps1       # 批量功能
 pwsh -STA -ExecutionPolicy Bypass -File _selftest_regression.ps1  # 界面构建 + 安全回归
 pwsh -STA -ExecutionPolicy Bypass -File _selftest_async.ps1       # 两阶段加载 + 主线程卡顿测量（会短暂弹窗）
+pwsh -STA -ExecutionPolicy Bypass -File _selftest_logic.ps1       # 纯逻辑回归：命令解析 / 风险矩阵 / 日志耐久 / 服务清单 / AI 协议
 pwsh -STA -ExecutionPolicy Bypass -File _selftest_task.ps1        # 计划任务 改命令/改名/撤销/删除（需管理员）
 ```
 
@@ -407,6 +408,7 @@ _selftest.ps1                CRUD 自测
 _selftest_batch.ps1          批量选择 / 批量删除 / 整批撤销 自测
 _selftest_regression.ps1     界面构建 + 安全回归自测
 _selftest_async.ps1          两阶段加载 + 主线程响应性测量
+_selftest_logic.ps1          纯逻辑回归：命令解析 / 风险矩阵 / 日志耐久 / 服务清单 / AI 协议
 _selftest_task.ps1           计划任务编辑链路（需管理员）
 README.md                    本文件
 ```

@@ -109,7 +109,10 @@ $script:JournalWarning = $null
 $script:SvcStateFile = Join-Path $script:AppDir 'managed-services.json'
 function Get-ManagedServices {
     if (-not (Test-Path $script:SvcStateFile)) { return @() }
-    try { return ,@(Get-Content $script:SvcStateFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return ,@() }
+    # 不能 return ,@(...)（逗号包装）—— 调用方在管道里接收时会把这个数组当成
+    # 单个对象：Set-ManagedService 读回两条以上会拼成 "A B" 一条，Get-AllStartupItems
+    # 的 -contains 也永远匹配不到。数组在这里就该被逐项枚举。
+    try { return @(Get-Content $script:SvcStateFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return @() }
 }
 function Set-ManagedService {
     param([string]$Name, [bool]$Tracked)
