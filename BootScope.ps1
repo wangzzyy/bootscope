@@ -603,7 +603,7 @@ function Get-AllStartupItems {
                         }
                         $en = Get-ApprovedState -Hive $L.Ap -Sub 'StartupFolder' -Name $f.Name
                         $out.Add((New-Item2 -Name $f.Name -Cmd $cmd -Kind 'Folder' -Scope $L.Scope -Label $L.Label `
-                            -Loc $f.FullName -Enabled $en -CanToggle $true -CanEdit $true -CanDelete $true `
+                            -Loc $f.FullName -Enabled $en -CanToggle $true -CanEdit ($f.Extension -ieq '.lnk') -CanDelete $true `
                             -Extra @{ Ap=$L.Ap; ApSub='StartupFolder'; File=$f.FullName; Ext=$f.Extension }))
                     } catch { $errs.Add("$($L.Label) → $($f.Name) : $($_.Exception.Message)") }
                 }
@@ -853,8 +853,30 @@ function Set-StartupItemEnabled {
 
 function Update-StartupItem {
     param($Item, [string]$NewName, [string]$NewCmd)
-    Write-Journal -Item $Item -Action 'edit' -NewName $NewName
     $renamed = ($NewName -ne $Item.Name)
+
+    # 全部校验放在写日志之前：被拒绝的编辑不会真正改动任何东西，
+    # 不该留下回滚记录 —— 否则「撤销上一步」会被这些从未生效的失败操作占位。
+    $task = $null
+    switch ($Item.Kind) {
+        'Folder' {
+            if ($Item.Extra.Ext -ine '.lnk') {
+                throw '仅支持编辑快捷方式(.lnk)。脚本文件请用「定位文件」打开后直接编辑其内容。'
+            }
+        }
+        'Task' {
+            $tp = [string]$Item.Extra.TaskPath
+            if ($tp -like '\Microsoft\Windows\*') { throw '系统计划任务不允许在此修改。' }
+            $task = Get-ScheduledTask -TaskName $Item.Extra.TaskName -TaskPath $tp -ErrorAction Stop
+            # 多动作任务在这里只能整体替换成一条，会丢掉其余动作 —— 明确拒绝
+            if (@($task.Actions).Count -gt 1) {
+                throw "该任务有 $(@($task.Actions).Count) 个动作，在此编辑会丢掉其余动作。请用「打开位置」在任务计划程序中修改。"
+            }
+            if (-not (Expand-Path (Resolve-Target $NewCmd).Path)) { throw '命令为空。' }
+        }
+    }
+
+    Write-Journal -Item $Item -Action 'edit' -NewName $NewName
 
     switch ($Item.Kind) {
         'Run' {
@@ -876,9 +898,6 @@ function Update-StartupItem {
             }
         }
         'Folder' {
-            if ($Item.Extra.Ext -ine '.lnk') {
-                throw '仅支持编辑快捷方式(.lnk)。脚本文件请用「定位文件」打开后直接编辑其内容。'
-            }
             # StartupApproved\StartupFolder 以「文件名」为键，改名时必须把状态迁移过去
             $live = Get-ApprovedState -Hive $Item.Extra.Ap -Sub 'StartupFolder' -Name $Item.Name
 
@@ -904,15 +923,9 @@ function Update-StartupItem {
         }
         'Task' {
             $tp = [string]$Item.Extra.TaskPath
-            if ($tp -like '\Microsoft\Windows\*') { throw '系统计划任务不允许在此修改。' }
-            $t = Get-ScheduledTask -TaskName $Item.Extra.TaskName -TaskPath $tp -ErrorAction Stop
-            # 多动作任务在这里只能整体替换成一条，会丢掉其余动作 —— 明确拒绝
-            if (@($t.Actions).Count -gt 1) {
-                throw "该任务有 $(@($t.Actions).Count) 个动作，在此编辑会丢掉其余动作。请用「打开位置」在任务计划程序中修改。"
-            }
+            $t = $task   # 校验阶段已取回（触发 / 权限 / 设置原样复用）
             $rt  = Resolve-Target $NewCmd
             $exe = Expand-Path $rt.Path
-            if (-not $exe) { throw '命令为空。' }
             $act = if ($rt.Args) { New-ScheduledTaskAction -Execute $exe -Argument $rt.Args }
                    else          { New-ScheduledTaskAction -Execute $exe }
             if ($renamed) {
@@ -1370,7 +1383,7 @@ function Format-ErrList {
     $a = @($Errors)
     if ($a.Count -eq 0) { return '' }
     $t = ($a | Select-Object -First $Max) -join "`n"
-    if ($a.Count -gt $Max) { $t += "`n… 以及另外 $($a.Count - $Max) 项（完整清单见回滚日志目录）" }
+    if ($a.Count -gt $Max) { $t += "`n… 以及另外 $($a.Count - $Max) 项" }
     return $t
 }
 
@@ -1426,7 +1439,16 @@ function Apply-Filter {
     if ($keepSel.Count -gt 0) {
         $set = New-Object 'System.Collections.Generic.HashSet[object]'
         foreach ($x in $keepSel) { [void]$set.Add($x) }
-        foreach ($v2 in $script:View) { if ($set.Contains($v2)) { [void]$UI.grid.SelectedItems.Add($v2) } }
+        $first = $null
+        foreach ($v2 in $script:View) {
+            if ($set.Contains($v2)) {
+                [void]$UI.grid.SelectedItems.Add($v2)
+                if ($null -eq $first) { $first = $v2 }
+            }
+        }
+        # 重绑后滚动位置会回到顶部。把第一个恢复选中的行滚回视野，
+        # 排查时「操作 → 刷新」不会丢掉位置。无窗口的自测路径没有布局，静默忽略。
+        if ($null -ne $first) { try { $UI.grid.ScrollIntoView($first) } catch { } }
     }
     Update-SelCount
 }
@@ -2163,6 +2185,9 @@ function Show-ItemDialog {
         $dlg.DialogResult = $true; $dlg.Close()
     })
     # dCancel 是 IsCancel，交给 WPF 处理，勿重复设置 DialogResult
+
+    # 打开即聚焦名称框（编辑时全选，方便直接覆盖改名）
+    $dlg.Add_ContentRendered({ $dName.Focus() | Out-Null; $dName.SelectAll() })
 
     if ($dlg.ShowDialog() -ne $true) { return $null }
     $r = $script:dlgResult
@@ -3293,6 +3318,13 @@ $UI.btnEdit.Add_Click({
     if ($sel.Count -ne 1) { Show-Msg "编辑一次只能处理一个条目（当前目标 $($sel.Count) 个）。" '提示' 'Warning'; return }
     $i = $sel[0]
     if (-not $i.CanEdit) {
+        if ($i.Kind -eq 'Folder') {
+            # 脚本文件的本体就是内容，改内容属于文件编辑，窗口里没有安全可回滚的载体
+            Show-Msg ("「$($i.Name)」是启动文件夹里的脚本文件，不能在此编辑。`n`n" +
+                      "请用「定位文件」在资源管理器里打开，直接编辑其内容。`n" +
+                      "（脚本内容本工具无法重建，改动请自行保留备份）") '不支持' 'Warning'
+            return
+        }
         Show-Msg ("「$($i.Label)」类型不支持在此编辑。`n`n" +
                   "服务的可执行文件路径改起来风险高（改错会导致服务无法启动，且本工具无法可靠回滚），" +
                   "请用 `"sc config <服务名> binPath= <新路径>`" 手工修改。") '不支持' 'Warning'
