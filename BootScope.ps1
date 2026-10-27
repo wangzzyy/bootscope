@@ -15,8 +15,16 @@
     所有删除操作先写入回滚日志，支持撤销。
 #>
 param(
+    # C# 托盘调用模式：status / enable / disable / toggle；不传时打开原 WPF 主界面
+    [ValidateSet('list','status','enable','disable','toggle','undo')][string]$TrayAction,
+    [string]$ItemName,
+    [string]$ItemKind,
+    [string]$ItemLoc,
+    [string]$Group,
     # 提权/STA 重启时由自己传入，防止提权始终失败时无限弹 UAC
-    [switch]$Relaunched
+    [switch]$Relaunched,
+    # 托盘普通权限降级执行时使用：明确禁止脚本自身弹 UAC，按当前权限尝试并返回错误
+    [switch]$NoElevation
 )
 
 # ══════════════════════════════════════════════════════════════════
@@ -32,8 +40,12 @@ function Test-Admin {
 $isAdmin = Test-Admin
 $isSta   = ([Threading.Thread]::CurrentThread.GetApartmentState() -eq 'STA')
 
-# WPF 要求 STA 单线程单元；pwsh 7 在某些宿主下默认 MTA，需带 -STA 重启。
-if (-not $isAdmin -or -not $isSta) {
+# CLI 命令不创建 WPF 界面，因此不要求 STA；尤其不能把 list/status 隐藏重启，
+# 否则 PowerShell 7 默认 MTA 时会把 JSON 输出送进隐藏子进程，看起来像窗口闪退。
+# 只有 GUI 模式需要 STA；写入类 CLI 仍按原策略要求管理员权限。
+$needsElevation = (-not $NoElevation) -and (-not $isAdmin) -and ((-not $TrayAction) -or ($TrayAction -notin @('list','status')))
+$needsSta = (-not $TrayAction) -and (-not $isSta)
+if ($needsElevation -or $needsSta) {
     Add-Type -AssemblyName System.Windows.Forms
     # 已经重启过一次还是不满足条件，说明重启这条路走不通（组策略拦截、
     # STA 检测异常等）。再启动一次只会无限弹 UAC，直接报错退出。
@@ -54,10 +66,18 @@ if (-not $isAdmin -or -not $isSta) {
     $exe   = if (Test-Path $pwsh7) { $pwsh7 } else { $ps51 }
     $argv  = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
                '-File', "`"$self`"", '-Relaunched')
+    if ($TrayAction) {
+        $argv += @('-TrayAction', $TrayAction)
+        if ($ItemName) { $argv += @('-ItemName', "`"$ItemName`"") }
+        if ($ItemKind) { $argv += @('-ItemKind', "`"$ItemKind`"") }
+        if ($ItemLoc)  { $argv += @('-ItemLoc',  "`"$ItemLoc`"") }
+        if ($Group)    { $argv += @('-Group',    "`"$Group`"") }
+    }
 
     try {
         if ($isAdmin) { Start-Process -FilePath $exe -ArgumentList $argv }          # 仅缺 STA
-        else          { Start-Process -FilePath $exe -ArgumentList $argv -Verb RunAs }
+        elseif ($TrayAction -in @('list','status')) { Start-Process -FilePath $exe -ArgumentList $argv } # 只读命令不提权
+        else { Start-Process -FilePath $exe -ArgumentList $argv -Verb RunAs }
     } catch {
         [System.Windows.Forms.MessageBox]::Show(
             "本工具需要管理员权限才能修改系统自启动项。`n`n提权请求被取消或失败：`n$($_.Exception.Message)",
@@ -66,13 +86,16 @@ if (-not $isAdmin -or -not $isSta) {
     exit
 }
 
-try {
-    Add-Type -Namespace Native -Name Win -MemberDefinition @'
+# 仅隐藏 GUI 启动时的控制台。CLI 模式必须保留当前控制台，让 JSON/错误信息可见。
+if (-not $TrayAction) {
+    try {
+        Add-Type -Namespace Native -Name Win -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 '@
-    [Native.Win]::ShowWindow([Native.Win]::GetConsoleWindow(), 0) | Out-Null
-} catch { }
+        [Native.Win]::ShowWindow([Native.Win]::GetConsoleWindow(), 0) | Out-Null
+    } catch { }
+}
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -1519,6 +1542,195 @@ if ($light -eq 1) {
 }
 
 # ══════════════════════════════════════════════════════════════════
+#  6.5 命令行业务入口（非 UI 模式）
+# 协议：list / status / enable / disable / toggle / undo
+# stdout：单行 JSON；退出码 0=成功，1=参数或执行错误，2=找不到/匹配不唯一，3=不支持操作。
+# 不传 -TrayAction 时，继续进入原有 WPF 主界面。
+# ══════════════════════════════════════════════════════════════════
+function Write-BootScopeCliResult {
+    param([object]$Result, [int]$ExitCode = 0)
+    $json = $Result | ConvertTo-Json -Compress -Depth 7
+    [Console]::Out.WriteLine($json)
+    $script:BootScopeCliExitCode = $ExitCode
+    # 用内部哨兵跳出当前 CLI 业务块；绝不调用 exit，以免关闭调用者的 PowerShell 会话。
+    throw '__BOOT SCOPE CLI RESULT WRITTEN__'
+}
+
+if ($TrayAction) {
+    $oldProgress = $global:SM_PROGRESS
+    try {
+        $global:SM_PROGRESS = $null
+        $script:VerifySig = $false
+
+        if ($TrayAction -eq 'undo') {
+            $message = Undo-LastAction
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$true; action='undo'; message=[string]$message }) 0
+        }
+
+        # 分组 CLI 快捷路径：只读 groups.json，并按目标组成员精确查询/操作；不枚举全部系统启动项。
+        if (($TrayAction -in @('status','enable','disable','toggle')) -and ($Group -or -not $ItemName)) {
+            if (-not (Test-Path -LiteralPath $script:GroupConfigPath)) {
+                Write-BootScopeCliResult ([pscustomobject]@{ok=$false;action=$TrayAction;message="找不到分组配置：$($script:GroupConfigPath)"}) 1
+            }
+            $groupCfg = Get-Content -LiteralPath $script:GroupConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            $groupName = if ($Group) { $Group } else { [string]$groupCfg.selectedGroup }
+            $targetGroup = @($groupCfg.groups | Where-Object { [string]$_.name -ceq $groupName })
+            if ($targetGroup.Count -ne 1) {
+                Write-BootScopeCliResult ([pscustomobject]@{ok=$false;action=$TrayAction;group=$groupName;message="分组不存在或名称不唯一：$groupName"}) 2
+            }
+            $targetGroup = $targetGroup[0]
+            $members = @($targetGroup.items)
+            if ($TrayAction -eq 'status' -and $members.Count -eq 0) {
+                Write-BootScopeCliResult ([pscustomobject]@{ok=$true;action='status';group=$groupName;enabled=[bool]$targetGroup.enabled;count=0;items=@();message='分组为空'}) 0
+            }
+            if ($members.Count -eq 0) {
+                Write-BootScopeCliResult ([pscustomobject]@{ok=$false;action=$TrayAction;group=$groupName;message='该分组没有成员。'}) 2
+            }
+
+            # 只针对 groups.json 里列出的条目查状态。source 是脚本内部类型：Run / Folder / Task。
+            $memberStates = @(
+                foreach ($m in $members) {
+                    $source = [string]$m.source
+                    $name = [string]$m.name
+                    $loc = [string]$m.location
+                    $cliItem = $null
+                    $exists = $false
+                    $enabled = $null
+                    switch ($source) {
+                        'Run' {
+                            $runLoc = @($RUN_LOCS | Where-Object { [string]::Equals([string]$_.Reg, $loc, [StringComparison]::OrdinalIgnoreCase) })
+                            if ($runLoc.Count -ne 1 -or -not $runLoc[0].Ap) {
+                                throw "该注册表启动位置不支持启停：$loc"
+                            }
+                            $runLoc = $runLoc[0]
+                            if (Test-Path -LiteralPath $runLoc.Reg) {
+                                $rk = Get-Item -LiteralPath $runLoc.Reg -ErrorAction Stop
+                                try { $exists = @($rk.GetValueNames() | Where-Object { [string]::Equals([string]$_, $name, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 }
+                                finally { if ($rk -is [IDisposable]) { $rk.Dispose() } }
+                            }
+                            if ($exists) { $enabled = Get-ApprovedState -Hive ([string]$runLoc.Ap) -Sub ([string]$runLoc.ApSub) -Name $name }
+                            $cliItem = [pscustomobject]@{Name=$name;Command=[string]$m.command;Kind='Run';Loc=$loc;Enabled=[bool]$enabled;CanToggle=$true;Extra=@{Ap=[string]$runLoc.Ap;ApSub=[string]$runLoc.ApSub}}
+                        }
+                        'Folder' {
+                            $folderLoc = @($FOLDER_LOCS | Where-Object {
+                                $base = [string]$_.Path
+                                $base -and ($loc -ieq (Join-Path $base $name) -or $loc.StartsWith(($base.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase))
+                            })
+                            if ($folderLoc.Count -eq 0) {
+                                # 配置中可能保存的是完整文件路径，仍须落在受支持的启动目录内。
+                                $folderLoc = @($FOLDER_LOCS | Where-Object { $_.Path -and $loc.StartsWith(([string]$_.Path).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) })
+                            }
+                            if ($folderLoc.Count -ne 1) { throw "启动文件不在受支持的启动文件夹中：$loc" }
+                            $folderLoc = $folderLoc[0]
+                            $exists = Test-Path -LiteralPath $loc -PathType Leaf
+                            if ($exists) { $enabled = Get-ApprovedState -Hive ([string]$folderLoc.Ap) -Sub 'StartupFolder' -Name $name }
+                            $cliItem = [pscustomobject]@{Name=$name;Command=[string]$m.command;Kind='Folder';Loc=$loc;Enabled=[bool]$enabled;CanToggle=$true;Extra=@{Ap=[string]$folderLoc.Ap;ApSub='StartupFolder';File=$loc;Ext=[IO.Path]::GetExtension($loc)}}
+                        }
+                        'Task' {
+                            $taskLoc = $loc.TrimEnd('\')
+                            $slash = $taskLoc.LastIndexOf('\')
+                            if ($slash -lt 0) { throw "计划任务位置格式无效：$loc" }
+                            $taskPath = $taskLoc.Substring(0, $slash + 1)
+                            $taskName = $taskLoc.Substring($slash + 1)
+                            $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue | Select-Object -First 1
+                            $exists = $null -ne $task
+                            if ($exists) { $enabled = ([string]$task.State -ne 'Disabled') }
+                            $cliItem = [pscustomobject]@{Name=$name;Command=[string]$m.command;Kind='Task';Loc=$loc;Enabled=[bool]$enabled;CanToggle=$true;Extra=@{TaskName=$taskName;TaskPath=$taskPath}}
+                        }
+                        default { throw "分组成员类型暂不支持：$source（$name）" }
+                    }
+                    [pscustomobject]@{item=$m;cliItem=$cliItem;enabled=$enabled;exists=[bool]$exists}
+                }
+            )
+            if ($TrayAction -eq 'status') {
+                Write-BootScopeCliResult ([pscustomobject]@{ok=$true;action='status';group=$groupName;enabled=[bool]$targetGroup.enabled;count=$members.Count;items=@($memberStates | ForEach-Object {@{name=$_.item.name;source=$_.item.source;exists=$_.exists;enabled=$_.enabled}})}) 0
+            }
+            $allOn = @($memberStates | Where-Object { $_.exists -and $_.enabled }).Count -eq $members.Count
+            $desired = switch ($TrayAction) { 'enable' {$true} 'disable' {$false} 'toggle' {-not $allOn} }
+            $results = New-Object System.Collections.Generic.List[object]
+            foreach ($state in $memberStates) {
+                $m = $state.item
+                try {
+                    if (-not $state.exists) { throw "启动项不存在：$($m.location)" }
+                    $cliItem = $state.cliItem
+                    $changed = ([bool]$state.enabled -ne [bool]$desired)
+                    if ($changed) {
+                        Set-StartupItemEnabled -Item $cliItem -Enabled ([bool]$desired)
+                        try { $null = Invoke-StartupProgramAction -Item $cliItem -Enabled ([bool]$desired) } catch { }
+                    }
+                    $results.Add([pscustomobject]@{name=[string]$m.name;source=[string]$m.source;ok=$true;enabled=[bool]$desired;changed=$changed})
+                } catch { $results.Add([pscustomobject]@{name=[string]$m.name;source=[string]$m.source;ok=$false;message=$_.Exception.Message}) }
+            }
+            $failed = @($results | Where-Object { -not $_.ok }).Count
+            if ($failed -eq 0) {
+                $targetGroup.enabled = [bool]$desired
+                $tmpCfg = "$($script:GroupConfigPath).tmp"
+                $jsonCfg = $groupCfg | ConvertTo-Json -Depth 8
+                [System.IO.File]::WriteAllText($tmpCfg,$jsonCfg,(New-Object System.Text.UTF8Encoding($true)))
+                Move-Item -LiteralPath $tmpCfg -Destination $script:GroupConfigPath -Force
+            }
+            Write-BootScopeCliResult ([pscustomobject]@{ok=($failed -eq 0);action=$TrayAction;group=$groupName;enabled=[bool]$desired;count=$members.Count;changed=@($results | Where-Object {$_.changed}).Count;items=@($results);message=$(if($failed -eq 0){'分组操作成功'}else{'部分项目操作失败；分组配置状态未更新'})}) $(if($failed -eq 0){0}else{1})
+        }
+
+        $items = @(Get-AllStartupItems -IncludeMsServices $true)
+        if ($TrayAction -eq 'list') {
+            $data = @($items | ForEach-Object {
+                [pscustomobject]@{
+                    name=[string]$_.Name; kind=[string]$_.Kind; location=[string]$_.Loc
+                    command=[string]$_.Command; enabled=[bool]$_.Enabled
+                    canToggle=[bool]$_.CanToggle; canEdit=[bool]$_.CanEdit; canDelete=[bool]$_.CanDelete
+                }
+            })
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$true; action='list'; count=$data.Count; items=$data }) 0
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ItemName)) {
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$false; action=$TrayAction; message='该命令必须提供 -ItemName。' }) 1
+        }
+        $matches = @($items | Where-Object {
+            [string]::Equals([string]$_.Name, $ItemName, [StringComparison]::OrdinalIgnoreCase) -and
+            (-not $ItemKind -or [string]::Equals([string]$_.Kind, $ItemKind, [StringComparison]::OrdinalIgnoreCase)) -and
+            (-not $ItemLoc -or [string]::Equals([string]$_.Loc, $ItemLoc, [StringComparison]::OrdinalIgnoreCase))
+        })
+        if ($matches.Count -ne 1) {
+            $message = if ($matches.Count -eq 0) { "未找到启动项：$ItemName" } else { "启动项名称匹配到 $($matches.Count) 项；请同时传入 -ItemKind 和/或 -ItemLoc 消歧。" }
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$false; action=$TrayAction; message=$message; count=$matches.Count }) 2
+        }
+        $item = $matches[0]
+        if ($TrayAction -eq 'status') {
+            Write-BootScopeCliResult ([pscustomobject]@{
+                ok=$true; action='status'; name=$item.Name; kind=$item.Kind; location=$item.Loc
+                enabled=[bool]$item.Enabled; canToggle=[bool]$item.CanToggle; message='状态读取成功'
+            }) 0
+        }
+        if (-not $item.CanToggle) {
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$false; action=$TrayAction; name=$item.Name; message='该启动项不支持启用/禁用，或受系统策略限制。' }) 3
+        }
+        $desired = switch ($TrayAction) { 'enable' {$true} 'disable' {$false} 'toggle' {-not [bool]$item.Enabled} }
+        $wasEnabled = [bool]$item.Enabled
+        if ($wasEnabled -ne [bool]$desired) {
+            Set-StartupItemEnabled -Item $item -Enabled ([bool]$desired)
+            # 保留原业务语义：普通 EXE 启动项会尝试启动/关闭对应程序；失败不回滚注册状态。
+            $program = $null
+            try { $program = Invoke-StartupProgramAction -Item $item -Enabled ([bool]$desired) }
+            catch { $program = [pscustomobject]@{ Status='Error'; Message=$_.Exception.Message } }
+        } else { $program = $null }
+        Write-BootScopeCliResult ([pscustomobject]@{
+            ok=$true; action=$TrayAction; name=$item.Name; kind=$item.Kind; location=$item.Loc
+            enabled=[bool]$desired; changed=($wasEnabled -ne [bool]$desired)
+            programStatus=$(if($program){$program.Status}else{'NoChange'})
+            message=$(if($program -and $program.Message){$program.Message}else{'操作成功'})
+        }) 0
+    } catch {
+        if ($_.Exception.Message -ne '__BOOT SCOPE CLI RESULT WRITTEN__') {
+            Write-BootScopeCliResult ([pscustomobject]@{ ok=$false; action=$TrayAction; message=$_.Exception.Message }) 1
+        }
+    } finally { $global:SM_PROGRESS = $oldProgress }
+    # 脚本级 return 结束本次脚本执行，但不退出交互式 PowerShell 宿主。
+    return
+}
+
+# ══════════════════════════════════════════════════════════════════
 #  7. XAML 界面
 # ══════════════════════════════════════════════════════════════════
 $xamlRaw = @'
@@ -1660,7 +1872,7 @@ $xamlRaw = @'
             <TextBlock Text="选择编辑目标；复选框直接启停整组" FontSize="10.5" Foreground="@Muted@" Margin="0,3,0,0" TextWrapping="Wrap"/>
           </StackPanel>
           <Button Grid.Column="1" x:Name="btnGroupAdd" Width="34" Height="42" Padding="2,0" Margin="0,0,2,0" ToolTip="新建分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 8,1 L 8,15 M 1,8 L 15,8" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
-          <Button Grid.Column="2" x:Name="btnGroupRemove" Width="34" Height="42" Padding="2,0" Margin="2,0,2,0" ToolTip="删除选中分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 1,2 L 15,2" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
+          <Button Grid.Column="2" x:Name="btnGroupRemove" Width="34" Height="42" Padding="2,0" Margin="2,0,2,0" ToolTip="删除选中分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 1,7 L 15,7" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
           <StackPanel Grid.Column="3" VerticalAlignment="Center" Margin="0,0,0,0">
             <Button x:Name="btnGroupUp" Content="▲" Width="25" Height="20" Padding="0" Margin="0,0,0,1" FontSize="10" ToolTip="将选中分组上移"/>
             <Button x:Name="btnGroupDown" Content="▼" Width="25" Height="20" Padding="0" Margin="0,1,0,0" FontSize="10" ToolTip="将选中分组下移"/>
@@ -2002,7 +2214,7 @@ function Update-GroupPanel {
                     $members = @($script:Items | Where-Object { $keys.Contains([string](Get-StartupItemKey $_)) })
                     if ($members.Count -eq 0) {
                         Update-GroupPanel
-                        Show-Msg "分组'$($target.name)'没有匹配到当前启动项。请先在主表中把项目勾选加入该组。" '分组启用状态' 'Warning'
+                        Show-Msg "分组“$($target.name)”没有匹配到当前启动项。请先在主表中把项目勾选加入该组。" '分组启用状态' 'Warning'
                         return
                     }
 
@@ -2014,15 +2226,15 @@ function Update-GroupPanel {
                     if ($change.Count -eq 0) {
                         Update-GroupPanel
                         if ($blocked.Count -gt 0) {
-                            Show-Msg ("分组'$($target.name)'中没有可执行的启停项目。以下项目不支持启用/禁用：`n" + (($blocked | ForEach-Object { $_.Name }) -join '、')) '分组启用状态' 'Warning'
+                            Show-Msg ("分组“$($target.name)”中没有可执行的启停项目。以下项目不支持启用/禁用：`n" + (($blocked | ForEach-Object { $_.Name }) -join '、')) '分组启用状态' 'Warning'
                         } else {
-                            Show-Msg "分组'$($target.name)'中的项目已经处于目标状态，无需更改。" '分组启用状态' 'Information'
+                            Show-Msg "分组“$($target.name)”中的项目已经处于目标状态，无需更改。" '分组启用状态' 'Information'
                         }
                         return
                     }
 
                     $verb=if($desired){'启用'}else{'禁用'}
-                    $msg="将$verb分组'$($target.name)'中的 $($change.Count) 个启动项。"
+                    $msg="将$verb分组“$($target.name)”中的 $($change.Count) 个启动项。"
                     if($blocked.Count -gt 0){$msg += "`n另有 $($blocked.Count) 项不支持切换，将跳过。"}
                     $msg += "`n`n是否继续？"
                     if(-not (Confirm-Msg $msg '分组启用状态')) { Update-GroupPanel; return }
