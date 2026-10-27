@@ -1872,7 +1872,7 @@ $xamlRaw = @'
             <TextBlock Text="选择编辑目标；复选框直接启停整组" FontSize="10.5" Foreground="@Muted@" Margin="0,3,0,0" TextWrapping="Wrap"/>
           </StackPanel>
           <Button Grid.Column="1" x:Name="btnGroupAdd" Width="34" Height="42" Padding="2,0" Margin="0,0,2,0" ToolTip="新建分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 8,1 L 8,15 M 1,8 L 15,8" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
-          <Button Grid.Column="2" x:Name="btnGroupRemove" Width="34" Height="42" Padding="2,0" Margin="2,0,2,0" ToolTip="删除选中分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 1,7 L 15,7" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
+          <Button Grid.Column="2" x:Name="btnGroupRemove" Width="34" Height="42" Padding="2,0" Margin="2,0,2,0" ToolTip="删除选中分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 1,2 L 15,2" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
           <StackPanel Grid.Column="3" VerticalAlignment="Center" Margin="0,0,0,0">
             <Button x:Name="btnGroupUp" Content="▲" Width="25" Height="20" Padding="0" Margin="0,0,0,1" FontSize="10" ToolTip="将选中分组上移"/>
             <Button x:Name="btnGroupDown" Content="▼" Width="25" Height="20" Padding="0" Margin="0,1,0,0" FontSize="10" ToolTip="将选中分组下移"/>
