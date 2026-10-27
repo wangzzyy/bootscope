@@ -89,6 +89,122 @@ if (-not (Test-Path $script:AppDir) -and (Test-Path $legacyDir)) {
 }
 if (-not (Test-Path $script:AppDir)) { New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null }
 
+# 分组配置保存在脚本所在目录（当前程序目录），与 %LOCALAPPDATA% 中的回滚日志分离
+$script:GroupConfigPath = Join-Path (Split-Path -Parent $PSCommandPath) 'groups.json'
+$script:Groups = New-Object System.Collections.Generic.List[object]
+$script:SelectedGroupId = $null
+$script:GroupFilter = ''   # ''=全部启动项；custom:<id>=编辑该自定义组
+$script:UpdatingGroupBindings = $false
+$script:GroupToggleInProgress = $false
+$script:GroupFileWarning = ''
+$script:StartupItemKeyCache = @{}
+function Get-StartupItemKeyFromParts {
+    param([string]$Kind, [string]$Loc, [string]$Name, [string]$Command)
+    $raw = "$Kind|$Loc|$Name|$Command"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw)))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+function Get-StartupItemKey {
+    param($Item)
+    # 稳定键只在内存中使用，不再写入常规 groups.json 内容。
+    $raw = "$($Item.Kind)|$($Item.Loc)|$($Item.Name)|$($Item.Command)"
+    if ($script:StartupItemKeyCache.ContainsKey($raw)) { return [string]$script:StartupItemKeyCache[$raw] }
+    $key = Get-StartupItemKeyFromParts -Kind ([string]$Item.Kind) -Loc ([string]$Item.Loc) -Name ([string]$Item.Name) -Command ([string]$Item.Command)
+    $script:StartupItemKeyCache[$raw] = $key
+    return $key
+}
+function Load-GroupConfig {
+    $script:Groups.Clear()
+    $script:GroupFileWarning = ''
+    if (-not (Test-Path -LiteralPath $script:GroupConfigPath)) { return }
+    try {
+        $cfg = Get-Content -LiteralPath $script:GroupConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        # 仅接受当前简化格式，不再自动迁移或兼容读取旧版 groups.json。
+        if ($null -eq $cfg -or $null -eq $cfg.groups) {
+            throw '配置格式无效：缺少 groups 数组。请备份旧文件后删除 groups.json，再重新创建分组。'
+        }
+        $selectedName = [string]$cfg.selectedGroup
+        $seenNames = @{}
+        foreach ($g in @($cfg.groups)) {
+            if ([string]::IsNullOrWhiteSpace([string]$g.name)) { continue }
+            if ($seenNames.ContainsKey([string]$g.name)) { continue }
+            $seenNames[[string]$g.name] = $true
+            $keys = New-Object System.Collections.Generic.List[string]
+            foreach ($it in @($g.items)) {
+                if ($it.source -and $null -ne $it.location -and $it.name -and $null -ne $it.command) {
+                    $keys.Add((Get-StartupItemKeyFromParts -Kind ([string]$it.source) -Loc ([string]$it.location) -Name ([string]$it.name) -Command ([string]$it.command)))
+                }
+            }
+            $runtimeId = [guid]::NewGuid().ToString('N')
+            $script:Groups.Add([pscustomobject]@{
+                id=$runtimeId; name=[string]$g.name; enabled=if ($null -ne $g.enabled) { [bool]$g.enabled } else { $true }
+                order=if ($null -ne $g.order) { [int]$g.order } else { $script:Groups.Count }
+                itemKeys=@($keys | Select-Object -Unique)
+            })
+        }
+        $selectedGroup = @($script:Groups | Where-Object { [string]$_.name -eq $selectedName } | Select-Object -First 1)
+        if ($selectedGroup.Count -gt 0) {
+            $script:SelectedGroupId = [string]$selectedGroup[0].id
+            $script:GroupFilter = "custom:$($script:SelectedGroupId)"
+        } else {
+            $script:SelectedGroupId = $null
+            $script:GroupFilter = ''
+        }
+    } catch {
+        # 读取失败绝不覆盖原配置；把警告显示在分组栏底部。
+        $script:GroupFileWarning = "分组配置读取失败，原文件已保留：$($_.Exception.Message)"
+        $script:Groups.Clear()
+        $script:SelectedGroupId = $null
+        $script:GroupFilter = ''
+    }
+}
+function Save-GroupConfig {
+    # 仅保存当前简化格式的可读字段；内部 GUID/哈希不落盘。
+    $itemLookup = @{}
+    foreach ($it in $script:Items) { $itemLookup[(Get-StartupItemKey $it)] = $it }
+    $selected = @($script:Groups | Where-Object { [string]$_.id -eq [string]$script:SelectedGroupId } | Select-Object -First 1)
+    $cfg = [ordered]@{
+        selectedGroup=if ($selected.Count) { [string]$selected[0].name } else { '' }
+        groups=@($script:Groups | Sort-Object order | ForEach-Object {
+            $group = $_
+            $items = @(
+                foreach ($key in @($group.itemKeys | Where-Object { $_ } | Select-Object -Unique)) {
+                    $item = $itemLookup[[string]$key]
+                    if ($null -ne $item) {
+                        [ordered]@{
+                            name=[string]$item.Name
+                            type=[string]$item.Label
+                            source=[string]$item.Kind
+                            location=[string]$item.Loc
+                            command=[string]$item.Command
+                        }
+                    }
+                }
+            )
+            [ordered]@{ name=[string]$group.name; enabled=[bool]$group.enabled; order=[int]$group.order; items=@($items) }
+        })
+    }
+    $tmp = "$($script:GroupConfigPath).tmp"
+    try {
+        $json = $cfg | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($true)))
+        if (Test-Path -LiteralPath $script:GroupConfigPath) {
+            try { [System.IO.File]::Replace($tmp, $script:GroupConfigPath, $null, $true) }
+            catch { Move-Item -LiteralPath $tmp -Destination $script:GroupConfigPath -Force -ErrorAction Stop }
+        } else {
+            Move-Item -LiteralPath $tmp -Destination $script:GroupConfigPath -ErrorAction Stop
+        }
+        $script:GroupFileWarning = ''
+        return $true
+    } catch {
+        $script:GroupFileWarning = "分组配置保存失败：$($_.Exception.Message)"
+        try { if ($UI -and $UI.panGroups) { Update-GroupPanel } } catch { }
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+}
+
 # 导出要带 BOM，否则 Excel 按 ANSI 解码、中文全乱码。但两代 PowerShell 的写法不同：
 # PS7 的 'UTF8' 是无 BOM，要写 'utf8BOM'；5.1 没有 utf8BOM 这个值，它的 'UTF8' 本来就带 BOM。
 $script:ENC_BOM = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
@@ -394,8 +510,10 @@ public class SmItem : INotifyPropertyChanged
     public string Scope { get; set; }
     public string Label { get; set; }
     public string Loc { get; set; }
-    public bool   Enabled { get; set; }
-    public string StateText { get; set; }
+    private bool _enabled;
+    public bool Enabled { get { return _enabled; } set { if (_enabled != value) { _enabled = value; P("Enabled"); P("StateText"); } } }
+    private string _stateText = "";
+    public string StateText { get { return _stateText; } set { if (_stateText != value) { _stateText = value; P("StateText"); } } }
     public bool   CanToggle { get; set; }
     public bool   CanEdit { get; set; }
     public bool   CanDelete { get; set; }
@@ -406,7 +524,14 @@ public class SmItem : INotifyPropertyChanged
 
     // 界面存活期间会被改动的字段，必须发通知
     private bool _sel;
-    public bool Sel { get { return _sel; } set { if (_sel != value) { _sel = value; P("Sel"); } } }
+    public bool Sel { get { return _sel; } set { if (_sel != value) { _sel = value; P("Sel"); P("CheckState"); } } }
+    private bool _groupMember;
+    public bool GroupMember { get { return _groupMember; } set { if (_groupMember != value) { _groupMember = value; P("GroupMember"); P("CheckState"); } } }
+    private bool _groupEditEnabled;
+    public bool GroupEditEnabled { get { return _groupEditEnabled; } set { if (_groupEditEnabled != value) { _groupEditEnabled = value; P("GroupEditEnabled"); P("CheckState"); } } }
+    // 只显示一列复选框：全部启动项模式映射到批量选择，选中分组时映射到当前组成员。
+    // Sel 是唯一的界面勾选状态：全部启动项模式用于批量操作，选中分组时同时代表当前组成员。
+    public bool CheckState { get { return _sel; } set { Sel = value; P("CheckState"); } }
 
     private string _signer = "";
     public string Signer { get { return _signer; } set { _signer = value; P("Signer"); } }
@@ -1107,6 +1232,83 @@ function Set-StartupItemEnabled {
     }
 }
 
+function Invoke-StartupProgramAction {
+    param($Item, [bool]$Enabled)
+    # 只对普通 Run/启动文件夹中的明确 .exe 目标做程序联动；不按进程名强杀，避免误关同名宿主程序。
+    if ($Item.Kind -notin @('Run','Folder')) { return [pscustomobject]@{ Status='NotApplicable'; Message='' } }
+    $cmd = [string]$Item.Command
+    if ([string]::IsNullOrWhiteSpace($cmd)) { return [pscustomobject]@{ Status='Skipped'; Message="$($Item.Name)：没有可解析的程序命令" } }
+    $rt = Resolve-Target -Cmd $cmd
+    $path = Expand-Path ([string]$rt.Path)
+    if (-not [System.IO.Path]::IsPathRooted($path)) {
+        try {
+            $app = Get-Command $path -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            if ($app) { $path = [string]$app.Source }
+        } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($path) -or [IO.Path]::GetExtension($path) -ine '.exe' -or -not [IO.Path]::IsPathRooted($path)) {
+        return [pscustomobject]@{ Status='Skipped'; Message="$($Item.Name)：只对可解析的 EXE 程序执行联动" }
+    }
+    $path = [IO.Path]::GetFullPath($path)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ Status='Skipped'; Message="$($Item.Name)：程序文件不存在，未执行联动（$path）" }
+    }
+    $protectedHosts = @('powershell.exe','pwsh.exe','cmd.exe','wscript.exe','cscript.exe','rundll32.exe','regsvr32.exe','mshta.exe','explorer.exe','svchost.exe','dllhost.exe','taskhostw.exe')
+    if ($protectedHosts -contains ([IO.Path]::GetFileName($path).ToLowerInvariant())) {
+        return [pscustomobject]@{ Status='Skipped'; Message="$($Item.Name)：目标是通用系统宿主程序，为避免影响其他任务，跳过程序联动" }
+    }
+    $matchingProcesses = New-Object System.Collections.Generic.List[object]
+    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
+        try {
+            if ($proc.MainModule -and [string]::Equals([IO.Path]::GetFullPath([string]$proc.MainModule.FileName), $path, [StringComparison]::OrdinalIgnoreCase)) {
+                $matchingProcesses.Add($proc)
+            }
+        } catch { }
+    }
+    if ($Enabled) {
+        if ($matchingProcesses.Count -gt 0) {
+            $background = @($matchingProcesses | Where-Object { try { $_.Refresh(); $_.MainWindowHandle -eq [IntPtr]::Zero } catch { $false } })
+            if ($background.Count -gt 0) {
+                return [pscustomobject]@{ Status='AlreadyRunning'; Message="$($Item.Name)：检测到后台进程，优先保留后台实例，不重复启动" }
+            }
+            # 仅有前台窗口时重新执行注册的启动命令，模仿 Windows 启动项的调用方式；
+            # 支持单实例/托盘模式的应用可将这次调用转交给后台实例。
+        }
+        $workDir = [IO.Path]::GetDirectoryName($path)
+        if ([string]::IsNullOrWhiteSpace([string]$rt.Args)) {
+            Start-Process -FilePath $path -WorkingDirectory $workDir -ErrorAction Stop | Out-Null
+        } else {
+            Start-Process -FilePath $path -ArgumentList ([string]$rt.Args) -WorkingDirectory $workDir -ErrorAction Stop | Out-Null
+        }
+        return [pscustomobject]@{ Status='Started'; Message="$($Item.Name)：已尝试打开程序" }
+    }
+    $closed = 0; $stopped = 0; $failed = 0; $matched = $matchingProcesses.Count
+    if ($matched -eq 0) { return [pscustomobject]@{ Status='NotRunning'; Message="$($Item.Name)：程序当前未运行" } }
+    foreach ($proc in $matchingProcesses) {
+        try {
+            $proc.Refresh()
+            # 先尝试正常关闭窗口，给应用短暂时间保存状态；无窗口后台进程也会进入停止阶段。
+            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+                if ($proc.CloseMainWindow()) { $closed++ }
+                try { [void]$proc.WaitForExit(1200) } catch { }
+            }
+            $proc.Refresh()
+            if (-not $proc.HasExited) {
+                # 禁用时同时关闭后台应用：仅处理上方按完整 EXE 路径精确匹配的进程。
+                Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                $stopped++
+            }
+        } catch {
+            try {
+                $still = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+                if ($still) { $failed++ }
+            } catch { $failed++ }
+        }
+    }
+    if ($failed -gt 0) { return [pscustomobject]@{ Status='Partial'; Message="$($Item.Name)：匹配 $matched 个进程，已正常请求关闭 $closed 个、结束后台/残留进程 $stopped 个，另有 $failed 个无法结束（可能权限不足）" } }
+    return [pscustomobject]@{ Status='Stopped'; Message="$($Item.Name)：已处理 $matched 个进程（正常关闭请求 $closed 个，结束后台/残留进程 $stopped 个）" }
+}
+
 function Update-StartupItem {
     param($Item, [string]$NewName, [string]$NewCmd)
     Write-Journal -Item $Item -Action 'edit' -NewName $NewName
@@ -1422,6 +1624,11 @@ $xamlRaw = @'
   </Window.Resources>
 
   <Grid Margin="16">
+    <!-- 左侧固定分组栏，右侧主内容区；显式定义列，避免 Grid.Column=1 被压回第 0 列造成面板互相覆盖 -->
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="250" MinWidth="220"/>
+      <ColumnDefinition Width="*" MinWidth="620"/>
+    </Grid.ColumnDefinitions>
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>   <!-- 0 标题 -->
       <RowDefinition Height="Auto"/>   <!-- 1 统计 -->
@@ -1432,8 +1639,42 @@ $xamlRaw = @'
       <RowDefinition Height="Auto"/>   <!-- 6 操作栏 -->
     </Grid.RowDefinitions>
 
+    <!-- 分组栏：独立占据左列，始终位于批量勾选与详情面板左侧 -->
+    <Border Grid.Row="2" Grid.RowSpan="5" Grid.Column="0" Margin="0,0,12,0"
+            Background="@Surface2@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="8" Padding="10">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Grid Grid.Row="0" Margin="0,0,0,8">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,8,0">
+            <TextBlock Text="启动分组" FontSize="15" FontWeight="Bold" Foreground="@Ink@"/>
+            <TextBlock Text="选择编辑目标；复选框直接启停整组" FontSize="10.5" Foreground="@Muted@" Margin="0,3,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <Button Grid.Column="1" x:Name="btnGroupAdd" Width="34" Height="42" Padding="2,0" Margin="0,0,2,0" ToolTip="新建分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 8,1 L 8,15 M 1,8 L 15,8" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
+          <Button Grid.Column="2" x:Name="btnGroupRemove" Width="34" Height="42" Padding="2,0" Margin="2,0,2,0" ToolTip="删除选中分组"><Viewbox Width="16" Height="16" Stretch="Uniform"><Path Data="M 1,2 L 15,2" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Viewbox></Button>
+          <StackPanel Grid.Column="3" VerticalAlignment="Center" Margin="0,0,0,0">
+            <Button x:Name="btnGroupUp" Content="▲" Width="25" Height="20" Padding="0" Margin="0,0,0,1" FontSize="10" ToolTip="将选中分组上移"/>
+            <Button x:Name="btnGroupDown" Content="▼" Width="25" Height="20" Padding="0" Margin="0,1,0,0" FontSize="10" ToolTip="将选中分组下移"/>
+          </StackPanel>
+        </Grid>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel x:Name="panGroups"/>
+        </ScrollViewer>
+        <TextBlock Grid.Row="2" x:Name="lblGroupHint" Text="批量勾选与分组归属互不影响。选择自定义组后，主表仍显示全部启动项；成员变更实时保存。"
+                   TextWrapping="Wrap" Foreground="@Muted@" FontSize="10.5" Margin="0,8,0,0"/>
+      </Grid>
+    </Border>
     <!-- 标题栏 -->
-    <Grid Grid.Row="0" Margin="0,0,0,12">
+    <Grid Grid.Row="0" Grid.ColumnSpan="2" Margin="0,0,0,12">
       <StackPanel Orientation="Horizontal">
         <TextBlock Text="启视" FontSize="23" FontWeight="Bold" Foreground="@Ink@" VerticalAlignment="Center"/>
         <TextBlock Text="BootScope" FontSize="12" Foreground="@Muted@" Margin="8,0,0,3" VerticalAlignment="Bottom"/>
@@ -1453,7 +1694,7 @@ $xamlRaw = @'
     </Grid>
 
     <!-- 统计条 -->
-    <Border Grid.Row="1" Background="@Surface@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="8" Padding="14,11" Margin="0,0,0,10">
+    <Border Grid.Row="1" Grid.ColumnSpan="2" Background="@Surface@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="8" Padding="14,11" Margin="0,0,0,10">
       <StackPanel>
         <StackPanel Orientation="Horizontal" x:Name="panStats"/>
         <!-- 枚举失败过去是裸 catch 静默吞掉的，列表看起来完整但其实缺了东西 -->
@@ -1463,7 +1704,7 @@ $xamlRaw = @'
     </Border>
 
     <!-- 筛选栏 -->
-    <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid Grid.Row="2" Grid.Column="1" Margin="0,0,0,10">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="Auto"/>
@@ -1477,7 +1718,7 @@ $xamlRaw = @'
     </Grid>
 
     <!-- 勾选栏 -->
-    <Border Grid.Row="3" Background="@Surface3@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="7" Padding="11,7" Margin="0,0,0,8">
+    <Border Grid.Row="3" Grid.Column="1" Background="@Surface3@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="7" Padding="11,7" Margin="0,0,0,8">
       <Grid>
         <StackPanel Orientation="Horizontal">
           <TextBlock Text="批量勾选" Foreground="@Muted@" FontSize="12" VerticalAlignment="Center" Margin="0,0,10,0"/>
@@ -1498,7 +1739,7 @@ $xamlRaw = @'
     <!-- 行虚拟化：51 条只实例化 13 行，是上屏那一帧的关键。
          列虚拟化反而要关：只有 8 列，它的簿记开销比省下来的多
          —— 实测开启时重绑 + 布局 478ms，关闭后 212ms。 -->
-    <DataGrid Grid.Row="4" x:Name="grid" AutoGenerateColumns="False" IsReadOnly="True"
+    <DataGrid Grid.Row="4" Grid.Column="1" x:Name="grid" AutoGenerateColumns="False" IsReadOnly="True"
               CanUserAddRows="False" CanUserResizeRows="False" SelectionMode="Extended"
               GridLinesVisibility="Horizontal" HeadersVisibility="Column"
               ScrollViewer.HorizontalScrollBarVisibility="Auto"
@@ -1507,12 +1748,13 @@ $xamlRaw = @'
               VirtualizingPanel.IsVirtualizing="True"
               VirtualizingPanel.VirtualizationMode="Recycling">
       <DataGrid.Columns>
-        <DataGridTemplateColumn Header="勾选" Width="52" CanUserSort="False" SortMemberPath="Sel">
+        <DataGridTemplateColumn Header="勾选" Width="76" CanUserSort="False" SortMemberPath="CheckState">
           <DataGridTemplateColumn.CellTemplate>
             <DataTemplate>
-              <CheckBox IsChecked="{Binding Sel, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+              <CheckBox Tag="GroupMembership"
+                        IsChecked="{Binding CheckState, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                         HorizontalAlignment="Center" VerticalAlignment="Center"
-                        ToolTip="勾选后，删除 / 启用禁用 将作用于所有勾选项"/>
+                        ToolTip="全部启动项模式：用于批量操作；选中自定义分组后：用于加入/移出当前组。同一启动项可以属于多个组。"/>
             </DataTemplate>
           </DataGridTemplateColumn.CellTemplate>
         </DataGridTemplateColumn>
@@ -1528,18 +1770,36 @@ $xamlRaw = @'
       <DataGrid.RowStyle>
         <Style TargetType="DataGridRow">
           <Setter Property="Foreground" Value="@Ink@"/>
+          <Setter Property="BorderBrush" Value="Transparent"/>
+          <Setter Property="BorderThickness" Value="0,0,0,1"/>
           <Style.Triggers>
             <DataTrigger Binding="{Binding Risk}" Value="critical"><Setter Property="Background" Value="@CritBg@"/></DataTrigger>
             <DataTrigger Binding="{Binding Risk}" Value="warning"><Setter Property="Background" Value="@WarnBg@"/></DataTrigger>
             <DataTrigger Binding="{Binding Risk}" Value="stale"><Setter Property="Background" Value="@StaleBg@"/></DataTrigger>
             <DataTrigger Binding="{Binding Enabled}" Value="False"><Setter Property="Opacity" Value="0.55"/></DataTrigger>
+            <!-- 鼠标悬停时增加底色；勾选项用强调底色和强调色边线标识。 -->
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter Property="Background" Value="@Surface3@"/>
+              <Setter Property="BorderBrush" Value="@Line2@"/>
+            </Trigger>
+            <DataTrigger Binding="{Binding CheckState}" Value="True">
+              <Setter Property="Background" Value="@AccentSoft@"/>
+              <Setter Property="BorderBrush" Value="@Accent@"/>
+              <Setter Property="Foreground" Value="@Ink@"/>
+              <Setter Property="FontWeight" Value="SemiBold"/>
+            </DataTrigger>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter Property="Background" Value="@AccentSoft@"/>
+              <Setter Property="BorderBrush" Value="@Accent@"/>
+              <Setter Property="Foreground" Value="@Ink@"/>
+            </Trigger>
           </Style.Triggers>
         </Style>
       </DataGrid.RowStyle>
     </DataGrid>
 
     <!-- 详情 -->
-    <Border Grid.Row="5" Background="@Surface2@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="8" Padding="14,11" Margin="0,10,0,10">
+    <Border Grid.Row="5" Grid.Column="1" Background="@Surface2@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="8" Padding="14,11" Margin="0,10,0,10">
       <ScrollViewer MaxHeight="132" VerticalScrollBarVisibility="Auto">
         <StackPanel x:Name="panDetail">
           <TextBlock Text="选中一行查看详情" Foreground="@Muted@"/>
@@ -1548,7 +1808,7 @@ $xamlRaw = @'
     </Border>
 
     <!-- 操作栏 -->
-    <Grid Grid.Row="6">
+    <Grid Grid.Row="6" Grid.Column="1">
       <StackPanel Orientation="Horizontal">
         <Button x:Name="btnNew"    Content="新建"      Style="{StaticResource Primary}"/>
         <Button x:Name="btnEdit"   Content="编辑"/>
@@ -1579,10 +1839,11 @@ foreach ($k in $P.Keys) { $xaml = $xaml.Replace("@$k@", $P[$k]) }
 $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
 $win = [Windows.Markup.XamlReader]::Load($reader)
 
+$script:win = $win
 $UI = @{}
 foreach ($n in 'lblHost','lblBusy','lblWarn','chkSig','chkMs','btnRefresh','panStats','txtSearch','cboKind','cboRisk','cboState',
                 'grid','panDetail','btnNew','btnEdit','btnToggle','btnDel','btnLocate','btnReg','btnUndo','btnExport',
-                'btnAi','btnAiCfg','cboAi','btnSelAll','btnSelNone','btnSelInv','btnSelStale','btnSelRisk','lblSel') {
+                'btnAi','btnAiCfg','cboAi','btnGroupAdd','btnGroupRemove','btnGroupUp','btnGroupDown','panGroups','lblGroupHint','btnSelAll','btnSelNone','btnSelInv','btnSelStale','btnSelRisk','lblSel') {
     $UI[$n] = $win.FindName($n)
 }
 
@@ -1606,19 +1867,487 @@ $UI.cboKind.ItemsSource  = @('全部类型','注册表 Run','启动文件夹','�
 $UI.cboRisk.ItemsSource  = @('全部风险','危险','关注','残留','正常')
 $UI.cboState.ItemsSource = @('全部状态','已启用','已禁用')
 $UI.cboKind.SelectedIndex = 0; $UI.cboRisk.SelectedIndex = 0; $UI.cboState.SelectedIndex = 0
+Load-GroupConfig
 
 # ══════════════════════════════════════════════════════════════════
 #  8. 界面逻辑
 # ══════════════════════════════════════════════════════════════════
+function Get-SelectedGroup {
+    @($script:Groups | Where-Object { [string]$_.id -eq [string]$script:SelectedGroupId }) | Select-Object -First 1
+}
+function Update-GroupMemberFlags {
+    $script:UpdatingGroupBindings = $true
+    try {
+        $customSelected = ($script:GroupFilter -like 'custom:*')
+        $selected = Get-SelectedGroup
+        $selectedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        if ($selected) { foreach ($k in @($selected.itemKeys)) { if (-not [string]::IsNullOrWhiteSpace([string]$k)) { [void]$selectedKeys.Add([string]$k) } } }
+        foreach ($it in $script:Items) {
+            $key = Get-StartupItemKey $it
+            $member = ($customSelected -and $selectedKeys.Contains($key))
+            $it.GroupMember = $member
+            $it.GroupEditEnabled = $customSelected
+            # 实时版的核心行为：切换到分组时，把该组成员映射到唯一的 Sel 勾选状态。
+            # 全部启动项模式不重置 Sel，保留批量勾选语义。
+            if ($customSelected) { $it.Sel = [bool]$member }
+        }
+    } finally { $script:UpdatingGroupBindings = $false }
+}
+function Update-GroupMembershipView {
+    Update-GroupMemberFlags
+    if ($UI.grid) { Apply-Filter }
+    Update-GroupPanel
+}
+function Select-StartupGroup {
+    param([string]$GroupId)
+    if ($GroupId -eq 'all') {
+        $script:SelectedGroupId = $null; $script:GroupFilter = ''
+        # 切回“全部启动项”时清除当前自定义分组映射到 Sel 的勾选残留。
+        # 屏蔽界面绑定引起的 Checked/Unchecked 事件，避免把清理动作误写成分组成员变更。
+        $script:UpdatingGroupBindings = $true
+        try { foreach ($item in $script:Items) { $item.Sel = $false } }
+        finally { $script:UpdatingGroupBindings = $false }
+    } else {
+        if ($GroupId -like 'custom:*') { $GroupId = $GroupId.Substring(7) }
+        $target = @($script:Groups | Where-Object { [string]$_.id -eq $GroupId }) | Select-Object -First 1
+        if (-not $target) { return }
+        $script:SelectedGroupId = $GroupId; $script:GroupFilter = "custom:$GroupId"
+    }
+    # Apply-Filter 内部已同步成员勾选状态，不再重复遍历全量启动项。
+    Apply-Filter
+    Update-GroupPanel
+    [void](Save-GroupConfig)
+}
+function Get-GroupSummaries {
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    # 每条启动项只生成一次键；组成员通过 HashSet/哈希表查询，避免重复线性扫描。
+    $itemsByKey = @{}
+    foreach ($item in $script:Items) { $itemsByKey[(Get-StartupItemKey $item)] = $item }
+    foreach ($g in @($script:Groups | Sort-Object @{Expression={ [int]$_.order }}, @{Expression={ [string]$_.name }})) {
+        $keySet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($g.itemKeys)) { if (-not [string]::IsNullOrWhiteSpace([string]$key)) { [void]$keySet.Add([string]$key) } }
+        $total = 0; $enabledCount = 0; $canToggle = 0
+        foreach ($key in $keySet) {
+            $item = $itemsByKey[$key]
+            if ($null -eq $item) { continue }
+            $total++
+            if ($item.Enabled) { $enabledCount++ }
+            if ($item.CanToggle) { $canToggle++ }
+        }
+        $state = if ($total -gt 0 -and $enabledCount -eq $total) { $true } elseif ($enabledCount -eq 0) { $false } else { $null }
+        $result.Add([pscustomobject]@{ Key="custom:$($g.id)"; Id=[string]$g.id; Name=[string]$g.name; Total=$total; Enabled=$enabledCount; CanToggle=$canToggle; State=$state; IsCustom=$true })
+    }
+    return $result.ToArray()
+}
+function Update-GroupPanel {
+    if (-not $UI.panGroups) { return }
+    $UI.panGroups.Children.Clear()
+    $bc = [Windows.Media.BrushConverter]::new()
+    # 全部启动项：只选择显示范围，不编辑分组归属。
+    $allCard = New-Object Windows.Controls.Border; $allCard.Margin='0,0,0,3'; $allCard.Padding='4,2'; $allCard.CornerRadius='5'; $allCard.BorderThickness='1'
+    $allRow = New-Object Windows.Controls.Grid
+    $ac0 = New-Object Windows.Controls.ColumnDefinition; $ac0.Width = New-Object Windows.GridLength(1,[Windows.GridUnitType]::Star)
+    $ac1 = New-Object Windows.Controls.ColumnDefinition; $ac1.Width = [Windows.GridLength]::Auto
+    [void]$allRow.ColumnDefinitions.Add($ac0); [void]$allRow.ColumnDefinitions.Add($ac1)
+    $allBtn = New-Object Windows.Controls.Button
+    $allBtn.Content = '全部启动项'; $allBtn.HorizontalContentAlignment = 'Left'; $allBtn.Padding = '7,6'; $allBtn.BorderThickness = '0'
+    $allBtn.Background = [Windows.Media.Brushes]::Transparent
+    $allBtn.Foreground = $bc.ConvertFromString($P.Ink); $allBtn.Focusable=$false; $allBtn.ToolTip = '显示全部启动项；勾选列用于批量操作。'
+    $allCard.Background=$bc.ConvertFromString($(if ($script:GroupFilter -eq '') { $P.AccentSoft } else { $P.Surface2 }))
+    $allCard.BorderBrush=$bc.ConvertFromString($(if ($script:GroupFilter -eq '') { $P.Accent } else { $P.Line }))
+    $allCard.Add_PreviewMouseLeftButtonDown({ Select-StartupGroup -GroupId 'all' }.GetNewClosure())
+    [Windows.Controls.Grid]::SetColumn($allBtn,0)
+    $allCount = New-Object Windows.Controls.TextBlock
+    $allCount.Text = "$(@($script:Items).Count) 项 · $(@($script:Items | Where-Object { $_.Enabled }).Count) 开"
+    $allCount.FontSize = 10.5; $allCount.VerticalAlignment = 'Center'; $allCount.Margin = '4,0,6,0'; $allCount.Foreground = $bc.ConvertFromString($P.Muted)
+    [Windows.Controls.Grid]::SetColumn($allCount,1)
+    [void]$allRow.Children.Add($allBtn); [void]$allRow.Children.Add($allCount); $allCard.Child=$allRow; [void]$UI.panGroups.Children.Add($allCard)
+    foreach ($g in @(Get-GroupSummaries)) {
+        $row = New-Object Windows.Controls.Grid
+        $row.Margin = '0,0,0,3'
+        $c0=New-Object Windows.Controls.ColumnDefinition; $c0.Width=[Windows.GridLength]::Auto
+        $c1=New-Object Windows.Controls.ColumnDefinition; $c1.Width=New-Object Windows.GridLength(1,[Windows.GridUnitType]::Star)
+        $c2=New-Object Windows.Controls.ColumnDefinition; $c2.Width=[Windows.GridLength]::Auto
+        [void]$row.ColumnDefinitions.Add($c0); [void]$row.ColumnDefinitions.Add($c1); [void]$row.ColumnDefinitions.Add($c2)
+        $card = New-Object Windows.Controls.Border; $card.Margin='0,0,0,3'; $card.Padding='4,2'; $card.CornerRadius='5'; $card.BorderThickness='1'; $card.Tag=[string]$g.Key
+        $isSelected = ([string]$script:GroupFilter -eq [string]$g.Key)
+        $card.Background=$bc.ConvertFromString($(if ($isSelected) { $P.AccentSoft } else { $P.Surface2 }))
+        $card.BorderBrush=$bc.ConvertFromString($(if ($isSelected) { $P.Accent } else { $P.Line }))
+        $chk = $null
+        if ($g.IsCustom) {
+            $chk=New-Object Windows.Controls.CheckBox
+            $chk.IsThreeState=$true
+            $chk.Margin='5,0,4,0'
+            $chk.VerticalAlignment='Center'
+            $chk.HorizontalAlignment='Center'
+            $chk.IsChecked=$g.State
+            # 只要组里有成员就允许点击；无可切换项目时也给出明确提示，而不是表现为“点不动”。
+            $chk.IsEnabled=($g.Total -gt 0)
+            $chk.Tag=[string]$g.Id
+            $chk.ToolTip='直接启停本组可切换的启动项；混合状态点击后统一启用。'
+            # 不使用 GetNewClosure：它会创建动态模块作用域，使 $script:Groups 指向错误的脚本作用域。
+            # 分组 ID 从实际点击的复选框 Tag 读取，始终在当前脚本作用域查找数据。
+            $chk.Add_Click({
+                param($sender,$eventArgs)
+                if ($script:Flags['GroupToggleRunning']) { return }
+                Invoke-Guarded {
+                    $id = [string]$sender.Tag
+                    $target=@($script:Groups | Where-Object { [string]$_.id -eq $id }) | Select-Object -First 1
+                    if (-not $target) { throw "找不到分组：$id（复选框 Tag=$([string]$sender.Tag)）" }
+
+                    $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($key in @($target.itemKeys)) {
+                        if (-not [string]::IsNullOrWhiteSpace([string]$key)) { [void]$keys.Add([string]$key) }
+                    }
+                    $members = @($script:Items | Where-Object { $keys.Contains([string](Get-StartupItemKey $_)) })
+                    if ($members.Count -eq 0) {
+                        Update-GroupPanel
+                        Show-Msg "分组'$($target.name)'没有匹配到当前启动项。请先在主表中把项目勾选加入该组。" '分组启用状态' 'Warning'
+                        return
+                    }
+
+                    $allOn=(@($members | Where-Object { -not $_.Enabled }).Count -eq 0)
+                    # 全部已启用时点击统一禁用；全关或混合状态点击统一启用。
+                    $desired = -not $allOn
+                    $change=@($members | Where-Object { $_.CanToggle -and ([bool]$_.Enabled -ne $desired) })
+                    $blocked=@($members | Where-Object { -not $_.CanToggle })
+                    if ($change.Count -eq 0) {
+                        Update-GroupPanel
+                        if ($blocked.Count -gt 0) {
+                            Show-Msg ("分组'$($target.name)'中没有可执行的启停项目。以下项目不支持启用/禁用：`n" + (($blocked | ForEach-Object { $_.Name }) -join '、')) '分组启用状态' 'Warning'
+                        } else {
+                            Show-Msg "分组'$($target.name)'中的项目已经处于目标状态，无需更改。" '分组启用状态' 'Information'
+                        }
+                        return
+                    }
+
+                    $verb=if($desired){'启用'}else{'禁用'}
+                    $msg="将$verb分组'$($target.name)'中的 $($change.Count) 个启动项。"
+                    if($blocked.Count -gt 0){$msg += "`n另有 $($blocked.Count) 项不支持切换，将跳过。"}
+                    $msg += "`n`n是否继续？"
+                    if(-not (Confirm-Msg $msg '分组启用状态')) { Update-GroupPanel; return }
+
+                    $groupIdForWork = [string]$target.id
+                    $groupNameForWork = [string]$target.name
+                    $script:Flags['GroupToggleRunning'] = $true
+                    Set-Busy "正在$verb 分组“$groupNameForWork”…"
+                    $workerBody = @'
+$script:SvcStateFile = $SM_SvcStateFile
+$errs = New-Object 'System.Collections.Generic.List[string]'
+$successKeys = New-Object 'System.Collections.Generic.List[string]'
+$programMessages = New-Object 'System.Collections.Generic.List[string]'
+foreach ($item in $SM_Items) {
+    try {
+        Set-StartupItemEnabled -Item $item -Enabled ([bool]$SM_Desired)
+        $successKeys.Add("$($item.Kind)|$($item.Loc)|$($item.Name)|$($item.Command)")
+        try {
+            $pa = Invoke-StartupProgramAction -Item $item -Enabled ([bool]$SM_Desired)
+            if ($pa -and $pa.Status -notin @('Started','AlreadyRunning','Closing','NotRunning','NotApplicable')) { $programMessages.Add([string]$pa.Message) }
+        } catch { $programMessages.Add("$($item.Name)：启动项状态已修改，但程序联动失败：$($_.Exception.Message)") }
+    }
+    catch { $errs.Add("$($item.Name)：$($_.Exception.Message)") }
+}
+,([pscustomobject]@{ Errors = @($errs.ToArray()); SuccessKeys = @($successKeys.ToArray()); ProgramMessages = @($programMessages.ToArray()) })
+'@
+                    Start-BgWork -Body $workerBody `
+                        -Functions @('Set-StartupItemEnabled','Set-ApprovedState','Set-UwpStartupTaskEnabled','Set-ManagedService','Get-ManagedServices','Invoke-StartupProgramAction','Resolve-Target','Expand-Path') `
+                        -Vars @{
+                            SM_Items = @($change)
+                            SM_Desired = [bool]$desired
+                            SM_SvcStateFile = [string]$script:SvcStateFile
+                        } `
+                        -OnDone {
+                            param($result,$err)
+                            # 闭包只负责捕获本次操作参数；所有 UI/脚本状态更新交给原脚本作用域函数。
+                            Complete-GroupToggle -Result $result -ErrorText $err `
+                                -GroupId ([string]$groupIdForWork) -GroupName ([string]$groupNameForWork) `
+                                -Desired ([bool]$desired) -Verb ([string]$verb) `
+                                -ChangedCount ([int]@($change).Count) -BlockedNames @($blocked | ForEach-Object { [string]$_.Name })
+                        }.GetNewClosure() | Out-Null
+
+                } '分组启用/禁用'
+            })
+            [Windows.Controls.Grid]::SetColumn($chk,0)
+            [void]$row.Children.Add($chk)
+        } else {
+            $placeholder=New-Object Windows.Controls.TextBlock
+            $placeholder.Text=''
+            [Windows.Controls.Grid]::SetColumn($placeholder,0)
+            [void]$row.Children.Add($placeholder)
+        }
+        $btn=New-Object Windows.Controls.Button; $btn.Content=[string]$g.Name; $btn.HorizontalContentAlignment='Left'; $btn.VerticalContentAlignment='Center'; $btn.Padding='7,6'; $btn.BorderThickness='0'; $btn.Background=[Windows.Media.Brushes]::Transparent; $btn.Foreground=$bc.ConvertFromString($P.Ink); $btn.Focusable=$false
+        $btn.FontWeight=if($isSelected){'SemiBold'}else{'Normal'}; $btn.Tag=[string]$g.Key
+        $btn.ToolTip='选择此组作为编辑目标。主表“勾选”列会直接编辑当前组成员；同一启动项可以属于多个组。'
+        [Windows.Controls.Grid]::SetColumn($btn,1); [void]$row.Children.Add($btn)
+        $count=New-Object Windows.Controls.TextBlock; $count.Text="$($g.Total) 项"; $count.FontSize=10.5; $count.VerticalAlignment='Center'; $count.Margin='5,0,6,0'; $count.Foreground=$bc.ConvertFromString($P.Muted); $count.ToolTip="$($g.Total) 项；已启用 $($g.Enabled) 项；已禁用 $($g.Total-$g.Enabled) 项；可切换 $($g.CanToggle) 项。"
+        [Windows.Controls.Grid]::SetColumn($count,2); [void]$row.Children.Add($count)
+        $card.Child=$row
+        $card.Add_PreviewMouseLeftButtonDown({
+            param($sender,$eventArgs)
+            # Preview 事件先于内部 Button 的鼠标事件触发，避免子控件将冒泡事件标记为 Handled 后导致整行无法切换。
+            # 若点击源位于三态复选框内，只执行启停，不切换当前编辑组。
+            $node = $eventArgs.OriginalSource
+            $hitCheckBox = $false
+            while ($null -ne $node -and $node -ne $sender) {
+                if ($node -is [Windows.Controls.CheckBox]) { $hitCheckBox = $true; break }
+                try { $node = [Windows.Media.VisualTreeHelper]::GetParent($node) } catch { break }
+            }
+            if ($hitCheckBox) { return }
+            Select-StartupGroup -GroupId ([string]$sender.Tag)
+        }.GetNewClosure())
+        [void]$UI.panGroups.Children.Add($card)
+    }
+    if ($script:GroupFileWarning) {
+        $warn=New-Object Windows.Controls.TextBlock; $warn.Text=$script:GroupFileWarning; $warn.TextWrapping='Wrap'; $warn.Foreground=$bc.ConvertFromString($P.Warn); $warn.Margin='4,8,4,0'; $warn.FontSize=10.5
+        [void]$UI.panGroups.Children.Add($warn)
+    }
+}
+function Sync-SelectedGroupMembership {
+    # Sel 只服务于批量操作，绝不从 Sel 推导分组归属。
+    Update-GroupMemberFlags
+    Update-GroupPanel
+    [void](Save-GroupConfig)
+}
+function Set-BootScopeRoundedButtonTemplate {
+    param([Windows.Controls.Button]$Button, [double]$Radius = 0)
+    # 弹窗按钮统一使用直角；保留自定义模板以维持一致的悬停、按下和禁用反馈。
+    $xaml = @"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+  <Border x:Name="buttonBorder" CornerRadius="$Radius" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" />
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="buttonBorder" Property="Opacity" Value="0.88" /></Trigger>
+    <Trigger Property="IsPressed" Value="True"><Setter TargetName="buttonBorder" Property="Opacity" Value="0.72" /></Trigger>
+    <Trigger Property="IsEnabled" Value="False"><Setter TargetName="buttonBorder" Property="Opacity" Value="0.45" /></Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+"@
+    try { $Button.Template = [Windows.Markup.XamlReader]::Parse($xaml) } catch { $Button.ClearValue([Windows.Controls.Control]::TemplateProperty) }
+}
+function Show-BootScopeInputDialog {
+    param([string]$Title = '新建分组', [string]$Prompt = '请输入名称：', [string]$DefaultText = '')
+    $d = New-Object Windows.Window
+    $d.Title = $Title; $d.Width = 360; $d.MinWidth = 320; $d.MaxWidth = 440
+    $d.SizeToContent = [Windows.SizeToContent]::Height; $d.ResizeMode = [Windows.ResizeMode]::NoResize
+    $d.WindowStartupLocation = [Windows.WindowStartupLocation]::CenterOwner; $d.ShowInTaskbar = $false
+    $d.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Surface))
+    $d.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Ink))
+    $d.FontFamily = 'Microsoft YaHei UI, Segoe UI'; $d.FontSize = 12.5
+    try { if ($script:win -and $script:win.IsVisible) { $d.Owner = $script:win } elseif ($win -and $win.IsVisible) { $d.Owner = $win } } catch { }
+    $root = New-Object Windows.Controls.Border; $root.Padding = '16,14,16,12'; $root.CornerRadius = '0'; $root.BorderThickness = '1'
+    $root.BorderBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Line))
+    $root.Background = $d.Background
+    $stack = New-Object Windows.Controls.StackPanel
+    $heading = New-Object Windows.Controls.TextBlock; $heading.Text = $Title; $heading.FontSize = 15; $heading.FontWeight = [Windows.FontWeights]::SemiBold
+    $heading.Foreground = $d.Foreground; $heading.Margin = '0,0,0,10'; [void]$stack.Children.Add($heading)
+    $promptText = New-Object Windows.Controls.TextBlock; $promptText.Text = $Prompt; $promptText.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Ink2)); $promptText.Margin = '0,0,0,7'; [void]$stack.Children.Add($promptText)
+    $nameBox = New-Object Windows.Controls.TextBox; $nameBox.Text = $DefaultText; $nameBox.MinWidth = 280; $nameBox.Padding = '9,7'; $nameBox.FontSize = 13
+    $nameBox.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Surface2))
+    $nameBox.Foreground = $d.Foreground; $nameBox.BorderBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Line2)); $nameBox.BorderThickness = '1'; $nameBox.Margin = '0,0,0,14'
+    [void]$stack.Children.Add($nameBox)
+    $buttons = New-Object Windows.Controls.StackPanel; $buttons.Orientation = [Windows.Controls.Orientation]::Horizontal; $buttons.HorizontalAlignment = [Windows.HorizontalAlignment]::Right
+    $cancel = New-Object Windows.Controls.Button; $cancel.Content = '取消'; $cancel.MinWidth = 72; $cancel.Padding = '12,6'; $cancel.Margin = '6,0,0,0'; $cancel.IsCancel = $true
+    $cancel.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Surface2)); $cancel.Foreground = $d.Foreground; $cancel.BorderBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Line2)); $cancel.BorderThickness = '1'; Set-BootScopeRoundedButtonTemplate -Button $cancel
+    $ok = New-Object Windows.Controls.Button; $ok.Content = '创建'; $ok.MinWidth = 72; $ok.Padding = '12,6'; $ok.Margin = '6,0,0,0'; $ok.IsDefault = $true
+    $ok.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Accent)); $ok.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.AccentInk)); $ok.BorderBrush = $ok.Background; $ok.BorderThickness = '1'; Set-BootScopeRoundedButtonTemplate -Button $ok
+    $ok.Add_Click({ $d.Tag = [string]$nameBox.Text; $d.DialogResult = $true; $d.Close() }.GetNewClosure())
+    $cancel.Add_Click({ $d.Tag = $null; $d.DialogResult = $false; $d.Close() }.GetNewClosure())
+    [void]$buttons.Children.Add($cancel); [void]$buttons.Children.Add($ok); [void]$stack.Children.Add($buttons)
+    $root.Child = $stack; $d.Content = $root
+    $d.Add_ContentRendered({ $nameBox.Focus(); $nameBox.SelectAll() }.GetNewClosure())
+    [void]$d.ShowDialog()
+    return $d.Tag
+}
+function New-StartupGroup {
+    $name = Show-BootScopeInputDialog -Title '新建分组' -Prompt '请输入新分组名称：' -DefaultText '新分组'
+    if ([string]::IsNullOrWhiteSpace([string]$name)) { return }
+    $name = $name.Trim()
+    if (@($script:Groups | Where-Object { $_.name -eq $name }).Count -gt 0) {
+        Show-Msg '分组名称已存在，请使用其他名称。' '新建分组' 'Warning'; return
+    }
+    $g = [pscustomobject]@{ id=[guid]::NewGuid().ToString('N'); name=$name; enabled=$true; order=$script:Groups.Count; itemKeys=@() }
+    $script:Groups.Add($g)
+    $script:SelectedGroupId = $g.id
+    $script:GroupFilter = "custom:$($g.id)"
+    Update-GroupMembershipView
+    [void](Save-GroupConfig)
+}
+function Remove-StartupGroup {
+    $g = Get-SelectedGroup
+    if (-not $g) { Show-Msg '请先选择要删除的分组。'; return }
+    if (-not (Confirm-Msg "确定删除分组“$($g.name)”吗？`n不会删除系统中的启动项。")) { return }
+    [void]$script:Groups.Remove($g)
+    $remainingGroups = @($script:Groups | Sort-Object @{Expression={ [int]$_.order }}, @{Expression={ [string]$_.name }})
+    for ($i = 0; $i -lt $remainingGroups.Count; $i++) { $remainingGroups[$i].order = $i }
+    $script:SelectedGroupId = if ($script:Groups.Count) { $remainingGroups[0].id } else { $null }
+    $script:GroupFilter = if ($script:SelectedGroupId) { "custom:$($script:SelectedGroupId)" } else { '' }
+    Update-GroupMembershipView
+    [void](Save-GroupConfig)
+}
+function Move-StartupGroup {
+    param([ValidateSet('Up','Down')][string]$Direction)
+    $selected = Get-SelectedGroup
+    if (-not $selected) {
+        Show-Msg '请先选择要排序的自定义分组。' '分组排序' 'Information'
+        return
+    }
+
+    $ordered = @($script:Groups | Sort-Object @{Expression={ [int]$_.order }}, @{Expression={ [string]$_.name }})
+    $index = -1
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+        if ([string]$ordered[$i].id -eq [string]$selected.id) { $index = $i; break }
+    }
+    if ($index -lt 0) { return }
+    $targetIndex = if ($Direction -eq 'Up') { $index - 1 } else { $index + 1 }
+    if ($targetIndex -lt 0 -or $targetIndex -ge $ordered.Count) { return }
+
+    # 交换后重新编号，保证配置文件里的 order 连续、稳定且易读。
+    $current = $ordered[$index]
+    $neighbor = $ordered[$targetIndex]
+    $temp = [int]$current.order
+    $current.order = [int]$neighbor.order
+    $neighbor.order = $temp
+    $ordered = @($script:Groups | Sort-Object @{Expression={ [int]$_.order }}, @{Expression={ [string]$_.name }})
+    for ($i = 0; $i -lt $ordered.Count; $i++) { $ordered[$i].order = $i }
+
+    Update-GroupPanel
+    [void](Save-GroupConfig)
+}
+
+function Show-BootScopeDialog {
+    param(
+        [string]$Text,
+        [string]$Title = '启视',
+        [ValidateSet('Information','Warning','Error','Question')][string]$Icon = 'Information',
+        [ValidateSet('OK','YesNo')][string]$Buttons = 'OK'
+    )
+
+    # 使用与主窗口一致的主题色绘制轻量 WPF 对话框，避免系统 MessageBox 的旧式外观。
+    $d = New-Object Windows.Window
+    $d.Title = $Title
+    $d.Width = 420
+    $d.MinWidth = 340
+    $d.MaxWidth = 560
+    $d.SizeToContent = [Windows.SizeToContent]::Height
+    $d.MaxHeight = 500
+    $d.ResizeMode = [Windows.ResizeMode]::NoResize
+    $d.WindowStartupLocation = [Windows.WindowStartupLocation]::CenterOwner
+    $d.ShowInTaskbar = $false
+    $d.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Surface))
+    $d.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Ink))
+    $d.FontFamily = 'Microsoft YaHei UI, Segoe UI'
+    $d.FontSize = 13
+    try { if ($script:win -and $script:win.IsVisible) { $d.Owner = $script:win } elseif ($win -and $win.IsVisible) { $d.Owner = $win } } catch { }
+
+    $accent = switch ($Icon) {
+        'Warning' { $P.Warn }
+        'Error'   { $P.Crit }
+        'Question'{ $P.Accent }
+        default   { $P.Accent }
+    }
+    $glyph = switch ($Icon) {
+        'Warning' { '!' }
+        'Error'   { '×' }
+        'Question'{ '?' }
+        default   { 'i' }
+    }
+    $root = New-Object Windows.Controls.Border
+    $root.Padding = '16,14,16,12'
+    $root.CornerRadius = '0'
+    $root.BorderThickness = '1'
+    $root.BorderBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Line))
+    $root.Background = $d.Background
+    $layout = New-Object Windows.Controls.Grid
+    $rHead = New-Object Windows.Controls.RowDefinition; $rHead.Height = [Windows.GridLength]::Auto; $layout.RowDefinitions.Add($rHead)
+    $rText = New-Object Windows.Controls.RowDefinition; $rText.Height = [Windows.GridLength]::Auto; $layout.RowDefinitions.Add($rText)
+    $rButtons = New-Object Windows.Controls.RowDefinition; $rButtons.Height = [Windows.GridLength]::Auto; $layout.RowDefinitions.Add($rButtons)
+
+    $head = New-Object Windows.Controls.DockPanel
+    $head.LastChildFill = $true
+    $badge = New-Object Windows.Controls.Border
+    $badge.Width = 30; $badge.Height = 30; $badge.CornerRadius = '15'; $badge.Margin = '0,0,10,0'
+    $badge.VerticalAlignment = [Windows.VerticalAlignment]::Center
+    $badge.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($accent))
+    $glyphText = New-Object Windows.Controls.TextBlock
+    $glyphText.Text = $glyph; $glyphText.FontSize = 21; $glyphText.FontWeight = [Windows.FontWeights]::Bold
+    $glyphText.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.AccentInk))
+    $glyphText.HorizontalAlignment = [Windows.HorizontalAlignment]::Center; $glyphText.VerticalAlignment = [Windows.VerticalAlignment]::Center
+    $badge.Child = $glyphText
+    [void]$head.Children.Add($badge)
+    $titleText = New-Object Windows.Controls.TextBlock
+    $titleText.Text = $Title; $titleText.FontSize = 15; $titleText.FontWeight = [Windows.FontWeights]::SemiBold
+    $titleText.Foreground = $d.Foreground; $titleText.VerticalAlignment = [Windows.VerticalAlignment]::Center
+    [void]$head.Children.Add($titleText)
+    [Windows.Controls.Grid]::SetRow($head,0); [void]$layout.Children.Add($head)
+
+    $scroll = New-Object Windows.Controls.ScrollViewer
+    $scroll.Margin = '40,12,0,12'; $scroll.MaxHeight = 300
+    $scroll.VerticalScrollBarVisibility = [Windows.Controls.ScrollBarVisibility]::Auto
+    $body = New-Object Windows.Controls.TextBlock
+    $body.Text = [string]$Text; $body.TextWrapping = [Windows.TextWrapping]::Wrap
+    $body.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Ink2))
+    $body.FontSize = 12.5; $body.LineHeight = 19
+    $scroll.Content = $body
+    [Windows.Controls.Grid]::SetRow($scroll,1); [void]$layout.Children.Add($scroll)
+
+    $bar = New-Object Windows.Controls.StackPanel
+    $bar.Orientation = [Windows.Controls.Orientation]::Horizontal
+    $bar.HorizontalAlignment = [Windows.HorizontalAlignment]::Right
+    $bar.Margin = '0,2,0,0'
+    $makeButton = {
+        param([string]$Caption,[bool]$Primary)
+        $b = New-Object Windows.Controls.Button
+        $b.Content = $Caption; $b.MinWidth = 76; $b.Padding = '14,6'; $b.Margin = '6,0,0,0'
+        $b.FontSize = 13; $b.FontWeight = [Windows.FontWeights]::SemiBold
+        $b.Cursor = [Windows.Input.Cursors]::Hand
+        $b.BorderThickness = '1'; $b.Focusable = $true; Set-BootScopeRoundedButtonTemplate -Button $b
+        if ($Primary) {
+            $b.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Accent))
+            $b.Foreground = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.AccentInk))
+            $b.BorderBrush = $b.Background
+        } else {
+            $b.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Surface2))
+            $b.Foreground = $d.Foreground
+            $b.BorderBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($P.Line2))
+        }
+        return $b
+    }.GetNewClosure()
+    if ($Buttons -eq 'YesNo') {
+        $no = & $makeButton '取消' $false
+        $no.IsCancel = $true
+        $no.Add_Click({ $d.Tag = $false; $d.Close() }.GetNewClosure())
+        $yes = & $makeButton '继续' $true
+        $yes.IsDefault = $true
+        $yes.Add_Click({ $d.Tag = $true; $d.Close() }.GetNewClosure())
+        [void]$bar.Children.Add($no); [void]$bar.Children.Add($yes)
+    } else {
+        $ok = & $makeButton '知道了' $true
+        $ok.IsDefault = $true; $ok.IsCancel = $true
+        $ok.Add_Click({ $d.Tag = $true; $d.Close() }.GetNewClosure())
+        [void]$bar.Children.Add($ok)
+    }
+    [Windows.Controls.Grid]::SetRow($bar,2); [void]$layout.Children.Add($bar)
+    $root.Child = $layout; $d.Content = $root
+    $d.Add_ContentRendered({ try { $d.Activate() } catch { } }.GetNewClosure())
+    [void]$d.ShowDialog()
+    return $d.Tag
+}
 function Show-Msg {
     param([string]$Text, [string]$Title = '启视', [string]$Icon = 'Information')
-    [System.Windows.MessageBox]::Show($Text, $Title, 'OK', $Icon) | Out-Null
+    $kind = switch -Regex ($Icon) {
+        '^(Warning|Exclamation)$' { 'Warning'; break }
+        '^(Error|Hand|Stop)$'    { 'Error'; break }
+        '^Question$'              { 'Question'; break }
+        default                   { 'Information' }
+    }
+    [void](Show-BootScopeDialog -Text $Text -Title $Title -Icon $kind -Buttons 'OK')
 }
 function Confirm-Msg {
     param([string]$Text, [string]$Title = '请确认')
-    ([System.Windows.MessageBox]::Show($Text, $Title, 'YesNo', 'Warning')) -eq 'Yes'
+    $r = Show-BootScopeDialog -Text $Text -Title $Title -Icon 'Question' -Buttons 'YesNo'
+    return ($r -eq $true)
 }
-
 # MessageBox 不能滚动。批量操作的失败清单原本是整段无上限塞进去的，
 # 几十项时后面的内容直接看不到 —— 截断并注明还剩多少。
 function Format-ErrList {
@@ -1677,6 +2406,7 @@ function Apply-Filter {
             "$($_.Name) $($_.Command) $($_.Target) $($_.Signer) $($_.Label) $($_.Loc)".ToLower().Contains($ql)
         })
     }
+    Update-GroupMemberFlags
     $script:View = @($v | Sort-Object RiskRank, @{E={-[int]$_.Enabled}}, Kind, Name)
     $UI.grid.ItemsSource = $script:View
     if ($keepSel.Count -gt 0) {
@@ -1749,7 +2479,7 @@ $script:BgJobs = New-Object System.Collections.Generic.List[object]
 # 这些自由变量。但闭包有个陷阱 —— 闭包里**读** $script:X 正常，**写** $script:X
 # 却写进闭包自己的模块作用域，外面根本看不到。所以「是否正在加载」这类要跨回调
 # 传递的状态一律放进这个哈希表：改哈希表条目是「读变量 + 索引赋值」，闭包里有效。
-$script:Flags = @{ LoadRunning = $false; AiRunning = $false; SigDone = $true }
+$script:Flags = @{ LoadRunning = $false; AiRunning = $false; SigDone = $true; GroupToggleRunning = $false }
 
 # 直接从已加载的函数取源码，避免在后台脚本里重复维护一份逻辑
 function Get-FunctionSource {
@@ -3491,6 +4221,181 @@ $win.Dispatcher.Add_UnhandledException({
     try { Show-Msg "发生未处理的错误：`n$($e.Exception.Message)`n`n程序会继续运行，建议刷新后重试。" '错误' 'Error' } catch { }
 })
 
+Update-GroupPanel
+$UI.btnGroupAdd.Add_Click({ Invoke-Guarded { New-StartupGroup } '新建分组' })
+$UI.btnGroupRemove.Add_Click({ Invoke-Guarded { Remove-StartupGroup } '删除分组' })
+$UI.btnGroupUp.Add_Click({ Invoke-Guarded { Move-StartupGroup -Direction 'Up' } '分组上移' })
+$UI.btnGroupDown.Add_Click({ Invoke-Guarded { Move-StartupGroup -Direction 'Down' } '分组下移' })
+function Find-GroupMembershipCheckBox {
+    param($StartNode)
+    $node = $StartNode
+    $seen = New-Object 'System.Collections.Generic.HashSet[object]'
+    while ($null -ne $node) {
+        try { if (-not $seen.Add($node)) { break } } catch { }
+        if ($node -is [Windows.Controls.CheckBox] -and [string]$node.Tag -eq 'GroupMembership') { return $node }
+        $parent = $null
+        try {
+            if ($node -is [Windows.Media.Visual] -or $node -is [Windows.Media.Media3D.Visual3D]) {
+                $parent = [Windows.Media.VisualTreeHelper]::GetParent($node)
+            }
+        } catch { }
+        if ($null -eq $parent) {
+            try { $parent = [Windows.LogicalTreeHelper]::GetParent($node) } catch { }
+        }
+        if ($null -eq $parent) {
+            try { if ($node -is [Windows.FrameworkContentElement]) { $parent = $node.Parent } } catch { }
+        }
+        $node = $parent
+    }
+    return $null
+}
+$groupCheckHandler = [System.Windows.RoutedEventHandler]{
+    param($sender, $e)
+    try {
+        if ($script:UpdatingGroupBindings) { return }
+        if ($script:GroupFilter -notlike 'custom:*') { return }
+
+        # RoutedEvent 的 Source/OriginalSource 在 DataGrid 模板与绑定场景下可能不是 CheckBox，
+        # 分别沿视觉树和逻辑树向上查找，避免事件已触发但成员更新静默跳过。
+        $cb = Find-GroupMembershipCheckBox $e.OriginalSource
+        if ($null -eq $cb) { $cb = Find-GroupMembershipCheckBox $e.Source }
+        if ($null -eq $cb -and $sender -is [Windows.Controls.CheckBox] -and [string]$sender.Tag -eq 'GroupMembership') { $cb = $sender }
+        if ($null -eq $cb) { return }
+
+        $it = $cb.DataContext
+        if (-not $it) {
+            $rowNode = $cb
+            while ($null -ne $rowNode -and $rowNode -isnot [Windows.Controls.DataGridRow]) {
+                try { $rowNode = [Windows.Media.VisualTreeHelper]::GetParent($rowNode) } catch { $rowNode = $null }
+            }
+            if ($rowNode -is [Windows.Controls.DataGridRow]) { $it = $rowNode.Item }
+        }
+        if (-not $it) { throw '已捕获复选框事件，但无法取得对应启动项（DataContext 为空）。' }
+
+        $selectedGroupId = [string]$script:SelectedGroupId
+        $targetGroup = @($script:Groups | Where-Object { [string]$_.id -eq $selectedGroupId }) | Select-Object -First 1
+        if (-not $targetGroup) { throw "当前分组不存在：$selectedGroupId" }
+
+        # 使用复选框此刻的实际状态，不依赖 Checked/Unchecked 事件与绑定更新的先后顺序。
+        $desiredChecked = [bool]$cb.IsChecked
+        $itemKey = [string](Get-StartupItemKey $it)
+        if ([string]::IsNullOrWhiteSpace($itemKey)) { throw "无法为启动项「$($it.Name)」生成稳定键。" }
+
+        $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($existingKey in @($targetGroup.itemKeys)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$existingKey)) { [void]$keys.Add([string]$existingKey) }
+        }
+        if ($desiredChecked) { [void]$keys.Add($itemKey) } else { [void]$keys.Remove($itemKey) }
+        $targetGroup.itemKeys = @($keys | Sort-Object)
+
+        # 计数按 itemKeys 对应的实际启动项计算；侧栏重绘与配置保存合并到去抖定时器。
+        Update-GroupMemberFlags
+        Update-SelCount
+        Request-GroupUiRefresh
+    } catch {
+        $script:GroupFileWarning = "更新分组成员失败：$($_.Exception.Message)"
+        try { Update-GroupPanel } catch { }
+    }
+}
+# 分组成员切换时不要在每次点击的同步事件里重建整个侧栏、序列化配置。
+# 用短去抖定时器合并连续变更；复选框和成员映射先立即更新。
+$script:GroupUiRefreshTimer = New-Object Windows.Threading.DispatcherTimer
+$script:GroupUiRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(180)
+$script:GroupUiRefreshTimer.Add_Tick({
+    $script:GroupUiRefreshTimer.Stop()
+    try { Update-GroupPanel } catch { }
+    [void](Save-GroupConfig)
+})
+function Request-GroupUiRefresh {
+    $script:GroupUiRefreshTimer.Stop()
+    $script:GroupUiRefreshTimer.Start()
+}
+function Set-GroupToggleIdle {
+    $script:Flags['GroupToggleRunning'] = $false
+    Set-Busy ''
+}
+function Set-GroupEnabledValue {
+    param([string]$GroupId, [bool]$Enabled)
+    $g = @($script:Groups | Where-Object { [string]$_.id -eq $GroupId }) | Select-Object -First 1
+    if ($g) { $g.enabled = $Enabled }
+}
+
+# 后台分组启停的 UI 收尾必须在原脚本作用域执行。
+# 不在 GetNewClosure() 的回调体里直接读写 $script:Items / $script:Groups，
+# 否则动态模块作用域可能让界面更新写到另一份脚本状态，直到手动 F5 才看到变化。
+function Complete-GroupToggle {
+    param(
+        $Result,
+        [string]$ErrorText,
+        [string]$GroupId,
+        [string]$GroupName,
+        [bool]$Desired,
+        [string]$Verb,
+        [int]$ChangedCount,
+        [string[]]$BlockedNames = @()
+    )
+    Set-GroupToggleIdle
+    if ($ErrorText) {
+        Update-GroupPanel
+        Show-Msg "分组启用/禁用后台任务失败：`n$ErrorText" '分组启用状态' 'Error'
+        return
+    }
+
+    $r = @($Result)[0]
+    $errs = @()
+    if ($r -and $r.Errors) { $errs = @($r.Errors) }
+    $programMessages = @()
+    if ($r -and $r.ProgramMessages) { $programMessages = @($r.ProgramMessages) }
+    Set-GroupEnabledValue -GroupId $GroupId -Enabled $Desired
+    try {
+        $successSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        if ($r -and $r.SuccessKeys) {
+            foreach ($sk in @($r.SuccessKeys)) { [void]$successSet.Add([string]$sk) }
+        }
+        foreach ($cachedItem in $script:Items) {
+            $cachedKey = "$($cachedItem.Kind)|$($cachedItem.Loc)|$($cachedItem.Name)|$($cachedItem.Command)"
+            if ($successSet.Contains($cachedKey)) {
+                $cachedItem.Enabled = [bool]$Desired
+                $cachedItem.StateText = if ($Desired) { '已启用' } else { '已禁用' }
+            }
+        }
+        # 立刻刷新所有依赖当前缓存的 UI；不重新枚举系统启动项。
+        Update-Stats
+        Update-GroupPanel
+        if ($script:HasInpc) {
+            # 按新状态重新应用当前过滤和排序，同时保留对象引用及选中行。
+            Apply-Filter
+        } else {
+            Apply-Filter
+        }
+        [void](Save-GroupConfig)
+    } catch {
+        $script:GroupFileWarning = "刷新分组状态失败：$($_.Exception.Message)"
+        try { Update-GroupPanel } catch { }
+        Show-Msg "启动项已尝试切换，但刷新界面失败：`n$($_.Exception.Message)" '分组启用状态' 'Warning'
+    }
+
+    if ($errs.Count -gt 0 -or $BlockedNames.Count -gt 0) {
+        $report = '分组操作已完成。'
+        if ($BlockedNames.Count -gt 0) { $report += "`n跳过（不支持启停）：" + ($BlockedNames -join '、') }
+        if ($errs.Count -gt 0) { $report += "`n操作失败：`n" + (Format-ErrList $errs) }
+        if ($programMessages.Count -gt 0) { $report += "`n程序联动提示：`n" + (Format-ErrList $programMessages) }
+        Show-Msg $report '分组启用状态' 'Warning'
+    } elseif ($programMessages.Count -gt 0) {
+        $successText = '已{0} {1} 个启动项。' -f $Verb, $ChangedCount
+        $successText += "`n`n程序联动提示：`n" + (Format-ErrList $programMessages)
+        $successTitle = '分组“{0}”操作结果' -f $GroupName
+        Show-Msg -Text $successText -Title $successTitle -Icon 'Information'
+    } else {
+        $successText = '已{0} {1} 个启动项。' -f $Verb, $ChangedCount
+        $successTitle = '分组“{0}”操作结果' -f $GroupName
+        Show-Msg -Text $successText -Title $successTitle -Icon 'Information'
+    }
+}
+
+# Checked / Unchecked 路由事件；handledEventsToo 确保内部控件处理后仍接收。
+$UI.grid.AddHandler([Windows.Controls.Primitives.ToggleButton]::CheckedEvent, $groupCheckHandler, $true)
+$UI.grid.AddHandler([Windows.Controls.Primitives.ToggleButton]::UncheckedEvent, $groupCheckHandler, $true)
 $UI.btnRefresh.Add_Click({ Invoke-Guarded { Load-Items } '刷新' })
 $UI.chkSig.Add_Click({ Invoke-Guarded { Load-Items } '刷新' })
 $UI.chkMs.Add_Click({ Invoke-Guarded { Load-Items } '刷新' })
@@ -3594,17 +4499,27 @@ $UI.btnToggle.Add_Click({ Invoke-Guarded {
     }
 
     $ok = 0; $errs = New-Object System.Collections.Generic.List[string]
+    $programMessages = New-Object System.Collections.Generic.List[string]
     foreach ($i in $selected) {
         if (-not $i.CanToggle) { $errs.Add("$($i.Name)：$($i.Label) 不支持启用/禁用（可能受系统策略限制）"); continue }
+        $targetEnabled = -not [bool]$i.Enabled
         try {
-            Set-StartupItemEnabled -Item $i -Enabled (-not $i.Enabled)
+            Set-StartupItemEnabled -Item $i -Enabled $targetEnabled
+            # 状态切换成功后联动打开/关闭可识别的普通 EXE 程序；联动失败不回滚启动项状态。
+            try {
+                $pa = Invoke-StartupProgramAction -Item $i -Enabled $targetEnabled
+                if ($pa -and $pa.Status -notin @('Started','AlreadyRunning','Closing','NotRunning','NotApplicable')) { $programMessages.Add([string]$pa.Message) }
+            } catch { $programMessages.Add("$($i.Name)：启动项状态已修改，但程序联动失败：$($_.Exception.Message)") }
+            $i.Enabled = [bool]$targetEnabled
             $ok++
         } catch { $errs.Add("$($i.Name)：$($_.Exception.Message)") }
     }
-    Load-Items
+    Update-Stats
+    Update-GroupPanel
     $m = "已切换 $ok 项。"
     if ($errs.Count) { $m += "`n`n未处理 $($errs.Count) 项：`n" + (Format-ErrList $errs) }
-    Show-Msg $m
+    if ($programMessages.Count) { $m += "`n`n程序联动提示：`n" + (Format-ErrList $programMessages) }
+    Show-Msg $m '启用/禁用操作结果' $(if ($errs.Count -or $programMessages.Count) { 'Warning' } else { 'Information' })
 } '启用/禁用' })
 
 $UI.btnDel.Add_Click({ Invoke-Guarded {
