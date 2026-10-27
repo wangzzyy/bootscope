@@ -2214,7 +2214,7 @@ function Update-GroupPanel {
                     $members = @($script:Items | Where-Object { $keys.Contains([string](Get-StartupItemKey $_)) })
                     if ($members.Count -eq 0) {
                         Update-GroupPanel
-                        Show-Msg "分组“$($target.name)”没有匹配到当前启动项。请先在主表中把项目勾选加入该组。" '分组启用状态' 'Warning'
+                        Show-Msg "分组'$($target.name)'没有匹配到当前启动项。请先在主表中把项目勾选加入该组。" '分组启用状态' 'Warning'
                         return
                     }
 
@@ -2226,15 +2226,15 @@ function Update-GroupPanel {
                     if ($change.Count -eq 0) {
                         Update-GroupPanel
                         if ($blocked.Count -gt 0) {
-                            Show-Msg ("分组“$($target.name)”中没有可执行的启停项目。以下项目不支持启用/禁用：`n" + (($blocked | ForEach-Object { $_.Name }) -join '、')) '分组启用状态' 'Warning'
+                            Show-Msg ("分组'$($target.name)'中没有可执行的启停项目。以下项目不支持启用/禁用：`n" + (($blocked | ForEach-Object { $_.Name }) -join '、')) '分组启用状态' 'Warning'
                         } else {
-                            Show-Msg "分组“$($target.name)”中的项目已经处于目标状态，无需更改。" '分组启用状态' 'Information'
+                            Show-Msg "分组'$($target.name)'中的项目已经处于目标状态，无需更改。" '分组启用状态' 'Information'
                         }
                         return
                     }
 
                     $verb=if($desired){'启用'}else{'禁用'}
-                    $msg="将$verb分组“$($target.name)”中的 $($change.Count) 个启动项。"
+                    $msg="将$verb分组'$($target.name)'中的 $($change.Count) 个启动项。"
                     if($blocked.Count -gt 0){$msg += "`n另有 $($blocked.Count) 项不支持切换，将跳过。"}
                     $msg += "`n`n是否继续？"
                     if(-not (Confirm-Msg $msg '分组启用状态')) { Update-GroupPanel; return }

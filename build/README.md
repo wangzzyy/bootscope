@@ -2,7 +2,7 @@
 
 Windows 托盘前端 + PowerShell 启动项管理脚本。托盘菜单用于按分组启用/禁用启动项、打开原有主窗口、管理当前用户开机启动，以及可选安装/移除永久管理员后台。
 
-> 本说明描述本项目 v16 的当前实现。修改权限流程时，请同时检查 `Program.cs`、`BootScope_grouped_clickfix_v26_cli.ps1`、`BootScopeTray.csproj` 和本 README，避免只改 UI 而保留脚本二次提权逻辑。
+> 本说明描述本项目的当前实现。修改权限流程时，请同时检查 `Program.cs`、`BootScope.ps1`、`BootScopeTray.csproj` 和本 README，避免只改 UI 而保留脚本二次提权逻辑。
 
 ## 1. 基本功能
 
