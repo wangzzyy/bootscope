@@ -9,8 +9,9 @@
       · 启动文件夹             当前用户 · 所有用户
       · 计划任务               登录 / 开机触发
       · 服务                   自动启动
+      · UWP / MSIX             windows.startupTask（当前用户）
 
-    启用 / 禁用采用 Windows 原生 StartupApproved 机制，与任务管理器完全一致。
+    普通启动项使用 StartupApproved；UWP 启动任务使用 Windows 原生 SystemAppData 的 State 状态。
     所有删除操作先写入回滚日志，支持撤销。
 #>
 param(
@@ -545,6 +546,196 @@ function Set-Progress {
     if ($Total -ge 0) { $p['Total'] = $Total }
 }
 
+# UWP / MSIX 的 windows.startupTask 不在传统 Run 键或启动文件夹里。
+# Windows 为当前用户记录启动状态的位置通常是：
+# HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\<PackageFamilyName>\<TaskId>
+# 只枚举存在 State 的已注册任务，避免把所有已安装商店应用都误当成启动项。
+function Get-UwpStartupItems {
+    param(
+        [System.Collections.Generic.List[object]]$Output,
+        [System.Collections.Generic.List[string]]$Errors
+    )
+
+    $root = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData'
+    Set-Progress -Stage '读取 UWP 启动任务' -Done $Output.Count
+    if (-not (Test-Path -LiteralPath $root)) { return }
+
+    # Get-AppxPackage 用于把 PackageFamilyName 映射到安装位置；仅读取当前用户注册的包。
+    $packages = @{}
+    try {
+        if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+            if ($PSVersionTable.PSVersion.Major -ge 7) {
+                try { Import-Module Appx -UseWindowsPowerShell -ErrorAction Stop } catch { }
+            } else {
+                try { Import-Module Appx -ErrorAction Stop } catch { }
+            }
+        }
+        if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+            $Errors.Add('UWP 启动任务：当前 PowerShell 环境无法调用 Get-AppxPackage，已跳过 UWP 扫描。')
+            return
+        }
+        foreach ($pkg in @(Get-AppxPackage -ErrorAction Stop)) {
+            if ($pkg.PackageFamilyName) { $packages[[string]$pkg.PackageFamilyName] = $pkg }
+        }
+    } catch {
+        $Errors.Add("UWP 启动任务：读取已安装应用失败：$($_.Exception.Message)")
+        return
+    }
+
+    # Get-StartApps 提供 Windows 开始菜单中用户看到的本地化名称。
+    # 不直接把 40459File-New-Project.EarTrumpet 之类内部包名放进主列表。
+    $startNames = @{}
+    try {
+        if (-not (Get-Command Get-StartApps -ErrorAction SilentlyContinue)) {
+            if ($PSVersionTable.PSVersion.Major -ge 7) {
+                try { Import-Module StartLayout -UseWindowsPowerShell -ErrorAction Stop } catch { }
+            } else {
+                try { Import-Module StartLayout -ErrorAction Stop } catch { }
+            }
+        }
+        if (Get-Command Get-StartApps -ErrorAction SilentlyContinue) {
+            foreach ($entry in @(Get-StartApps -ErrorAction Stop)) {
+                $appId = [string]$entry.AppID
+                $display = [string]$entry.Name
+                if ($appId -and $display) { $startNames[$appId.ToLowerInvariant()] = $display.Trim() }
+            }
+        }
+    } catch { }
+
+    $explorer = Join-Path ([Environment]::GetFolderPath('Windows')) 'explorer.exe'
+    try {
+        foreach ($packageKey in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+            $pfn = [string]$packageKey.PSChildName
+            if (-not $packages.ContainsKey($pfn)) { continue }
+            $pkg = $packages[$pfn]
+            $taskKeys = @(Get-ChildItem -LiteralPath (Join-Path $root $pfn) -ErrorAction SilentlyContinue)
+            if ($taskKeys.Count -eq 0) { continue }
+
+            if (-not $pkg.InstallLocation) {
+                $Errors.Add("UWP 启动任务 → $($pkg.Name)：安装位置为空，无法解析启动任务名称。")
+                continue
+            }
+            $manifestPath = Join-Path ([string]$pkg.InstallLocation) 'AppxManifest.xml'
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                $Errors.Add("UWP 启动任务 → $($pkg.Name)：找不到应用清单，无法解析启动任务名称。")
+                continue
+            }
+
+            # 先用自动识别 BOM 的 StreamReader 检查清单是否真的声明了 windows.startupTask。
+            # 某些系统 MSIX（例如 Microsoft.LanguageExperiencePackzh-CN）也会在
+            # SystemAppData 下留下状态子键，但它们的清单不是启动任务清单，不应解析、更不应
+            # 作为“读取失败”报告。StreamReader 会正确处理 UTF-8 BOM/无 BOM 文件。
+            $manifestText = ''
+            try {
+                $textReader = New-Object System.IO.StreamReader($manifestPath, $true)
+                try { $manifestText = $textReader.ReadToEnd() } finally { $textReader.Dispose() }
+            } catch {
+                $Errors.Add("UWP 启动任务 → $($pkg.Name)：无法读取应用清单文本：$($_.Exception.Message)")
+                continue
+            }
+            if ($manifestText -notmatch '(?i)Category\s*=\s*["'']windows\.startupTask["'']') {
+                continue
+            }
+
+            # TaskId -> 清单中的 AppId、显示名；清单只对存在运行状态键的包解析一次。
+            # XmlReader 按 XML 声明/BOM 识别编码；禁止 DTD/外部实体，避免读取外部资源。
+            $taskInfo = @{}
+            $manifestReader = $null
+            try {
+                $xmlSettings = New-Object System.Xml.XmlReaderSettings
+                $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+                $xmlSettings.XmlResolver = $null
+                $manifestReader = [System.Xml.XmlReader]::Create($manifestPath, $xmlSettings)
+                $manifest = New-Object System.Xml.XmlDocument
+                $manifest.XmlResolver = $null
+                $manifest.Load($manifestReader)
+                $appNodes = $manifest.SelectNodes("/*[local-name()='Package']/*[local-name()='Applications']/*[local-name()='Application']")
+                foreach ($appNode in $appNodes) {
+                    $appId = [string]$appNode.GetAttribute('Id')
+                    $visual = $appNode.SelectSingleNode("./*[local-name()='VisualElements']")
+                    $appDisplayName = if ($visual) { [string]$visual.GetAttribute('DisplayName') } else { '' }
+                    $fullAppId = if ($pfn -and $appId) { "$pfn!$appId" } else { '' }
+                    $startName = if ($fullAppId -and $startNames.ContainsKey($fullAppId.ToLowerInvariant())) { [string]$startNames[$fullAppId.ToLowerInvariant()] } else { '' }
+
+                    $extensions = $appNode.SelectNodes("./*[local-name()='Extensions']/*[local-name()='Extension' and @Category='windows.startupTask']")
+                    foreach ($extension in $extensions) {
+                        $startupNode = $extension.SelectSingleNode(".//*[local-name()='StartupTask']")
+                        if (-not $startupNode) { continue }
+                        $taskId = [string]$startupNode.GetAttribute('TaskId')
+                        if (-not $taskId) { continue }
+                        $taskDisplay = [string]$startupNode.GetAttribute('DisplayName')
+                        $taskInfo[$taskId.ToLowerInvariant()] = @{
+                            TaskId = $taskId; AppId = $appId; AppName = $startName
+                            AppDisplayName = $appDisplayName; TaskDisplayName = $taskDisplay
+                        }
+                    }
+                }
+            } catch {
+                # 前置检查已确认清单声明了 windows.startupTask；此时解析失败才是真正的
+                # 启动任务清单错误，应该显示在窗口中，便于定位问题。
+                $Errors.Add("UWP 启动任务 → $($pkg.Name)：读取启动任务清单失败：$($_.Exception.Message)")
+                continue
+            } finally {
+                if ($manifestReader) { $manifestReader.Dispose() }
+            }
+
+            foreach ($taskKey in $taskKeys) {
+                $taskId = [string]$taskKey.PSChildName
+                $infoKey = $taskId.ToLowerInvariant()
+                if (-not $taskInfo.ContainsKey($infoKey)) { continue }
+                $taskPath = Join-Path (Join-Path $root $pfn) $taskId
+                try {
+                    $stateData = Get-ItemProperty -LiteralPath $taskPath -Name State -ErrorAction Stop
+                    if ($null -eq $stateData.State) { continue }
+                    $state = [int]$stateData.State
+                    # StartupTaskState：0=Disabled、1=DisabledByUser、2=Enabled、3=DisabledByPolicy；
+                    # 某些 Windows 版本/策略实现还会出现 4=EnabledByPolicy。
+                    if ($state -notin @(0,1,2,3,4)) { $Errors.Add("UWP 启动任务 → $($pkg.Name)\$taskId：未知状态值 $state。"); continue }
+                    $info = $taskInfo[$infoKey]
+
+                    $friendly = [string]$info.AppName
+                    if (-not $friendly -or $friendly -match '^(?i:ms-resource:)|^@') {
+                        $friendly = [string]$info.TaskDisplayName
+                    }
+                    if (-not $friendly -or $friendly -match '^(?i:ms-resource:)|^@') {
+                        $friendly = [string]$info.AppDisplayName
+                    }
+                    if (-not $friendly -or $friendly -match '^(?i:ms-resource:)|^@') {
+                        $friendly = [string]$pkg.Name
+                        # 对常见的数字发布者前缀包名做降噪：40459File-New-Project.EarTrumpet -> EarTrumpet。
+                        if ($friendly -match '^\d+[^.]*\.(.+)$') { $friendly = $Matches[1] }
+                        $friendly = $friendly -replace '\.', ' '
+                    }
+                    if ([string]::IsNullOrWhiteSpace($friendly)) { $friendly = $pfn }
+                    $friendly = $friendly.Trim()
+
+                    $launchId = if ($info.AppId) { "$pfn!$($info.AppId)" } else { "$pfn!App" }
+                    $cmd = '"' + $explorer + '" shell:AppsFolder\' + $launchId
+                    # UWP 的状态切换交给 Windows“启动应用”设置；策略控制状态不可直接切换。
+                    $canToggle = ($state -notin @(3,4))
+                    $extra = @{
+                        PackageName = [string]$pkg.Name
+                        PackageFamilyName = $pfn
+                        PackageFullName = [string]$pkg.PackageFullName
+                        ApplicationId = [string]$info.AppId
+                        TaskId = $taskId
+                        StartupState = $state
+                        RegistryPath = $taskPath
+                    }
+                    $item = New-Item2 -Name $friendly -Cmd $cmd -Kind 'UWP' -Scope '当前用户' `
+                        -Label 'UWP / MSIX 启动任务' -Loc $taskPath -Enabled ($state -in @(2,4)) `
+                        -CanToggle $canToggle -CanEdit $false -CanDelete $false -Extra $extra
+                    $Output.Add($item)
+                } catch {
+                    $Errors.Add("UWP 启动任务 → $($pkg.Name)\$taskId：$($_.Exception.Message)")
+                }
+            }
+        }
+    } catch {
+        $Errors.Add("UWP 启动任务：枚举注册状态失败：$($_.Exception.Message)")
+    }
+}
+
 function Get-AllStartupItems {
     param([bool]$IncludeMsServices = $false)
     $out  = New-Object System.Collections.Generic.List[object]
@@ -660,6 +851,10 @@ function Get-AllStartupItems {
             } catch { $errs.Add("服务 → $($s.Name) : $($_.Exception.Message)") }
         }
     } catch { $errs.Add("服务 : $($_.Exception.Message)") }
+
+    # ── UWP / MSIX StartupTask ──
+    try { Get-UwpStartupItems -Output $out -Errors $errs }
+    catch { $errs.Add("UWP 启动任务：$($_.Exception.Message)") }
 
     Set-Progress -Stage '整理结果' -Done $out.Count
     $script:LoadErrors = @($errs)
@@ -833,6 +1028,64 @@ function Remove-StartupItem {
             if ($LASTEXITCODE -ne 0) { throw "sc.exe delete 返回 $LASTEXITCODE（受保护的服务无法删除）" }
             Set-ManagedService -Name $Item.Extra.SvcName -Tracked $false
         }
+        'UWP' { throw 'UWP 启动任务由应用程序清单注册，不能单独删除；请使用启用/禁用，或通过 Windows 设置卸载应用。' }
+    }
+}
+
+function Set-UwpStartupTaskEnabled {
+    param($Item, [bool]$Enabled)
+
+    # Windows Task Manager/Startup Settings store UWP StartupTask state at:
+    # HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\<PFN>\<TaskId>\State
+    # StartupApproved is for classic Run/StartupFolder entries; it is not the state store for UWP StartupTask.
+    $pfn = [string]$Item.Extra.PackageFamilyName
+    $taskId = [string]$Item.Extra.TaskId
+    if ([string]::IsNullOrWhiteSpace($pfn) -or [string]::IsNullOrWhiteSpace($taskId)) {
+        throw 'UWP 启动项缺少 PackageFamilyName 或 TaskId，已拒绝修改。'
+    }
+
+    $rootSubKey = 'Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData'
+    $subKey = $rootSubKey + '\' + $pfn + '\' + $taskId
+    $baseKey = $null
+    $key = $null
+    try {
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::CurrentUser,
+            [Microsoft.Win32.RegistryView]::Default)
+        $key = $baseKey.OpenSubKey($subKey, $true)
+        if ($null -eq $key) { throw "找不到 UWP 启动状态注册表项：HKCU\$subKey" }
+        if (@($key.GetValueNames()) -notcontains 'State') {
+            throw "UWP 启动状态项中不存在 State 值：HKCU\$subKey"
+        }
+
+        $current = [int]$key.GetValue('State', -1)
+        if ($current -in @(3, 4)) {
+            throw '此 UWP 启动任务由系统策略管理，不能由当前用户切换。'
+        }
+        if ($current -notin @(0, 1, 2)) {
+            throw "UWP 启动任务状态值异常 ($current)，为避免破坏状态已停止修改。"
+        }
+
+        # StartupTaskState: 0=Disabled, 1=DisabledByUser, 2=Enabled,
+        # 3=DisabledByPolicy, 4=EnabledByPolicy. Task Manager's user-off state is 1.
+        $target = if ($Enabled) { 2 } else { 1 }
+        if ($current -ne $target) {
+            if (-not $Enabled) {
+                # Keep the timestamp value in the same location used by Windows for a user-disabled task.
+                $key.SetValue('LastDisabledTime', [long]([DateTime]::UtcNow.ToFileTime()),
+                    [Microsoft.Win32.RegistryValueKind]::QWord)
+            }
+            $key.SetValue('State', [int]$target, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $key.Flush()
+        }
+
+        $actual = [int]$key.GetValue('State', -1)
+        if ($actual -ne $target) {
+            throw "UWP 启动状态写入后验证失败：期望 $target，实际 $actual。"
+        }
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
     }
 }
 
@@ -848,6 +1101,9 @@ function Set-StartupItemEnabled {
                    Set-Service -Name $Item.Extra.SvcName -StartupType $m
                    # 记住被我们改成手动的服务，否则下次刷新它就从列表里消失了
                    Set-ManagedService -Name $Item.Extra.SvcName -Tracked (-not $Enabled) }
+        'UWP' {
+            Set-UwpStartupTaskEnabled -Item $Item -Enabled $Enabled
+        }
     }
 }
 
@@ -1346,7 +1602,7 @@ $script:BuildStamp = try {
 } catch { '?' }
 $UI.lblHost.Text = "$env:COMPUTERNAME \ $env:USERNAME   ·   构建 $script:BuildStamp"
 $UI.lblHost.ToolTip = "主程序文件的修改时间。`n若你刚改过代码但这里还是旧时间，说明当前跑的是改动前启动的实例，关掉重开即可。"
-$UI.cboKind.ItemsSource  = @('全部类型','注册表 Run','启动文件夹','计划任务','服务')
+$UI.cboKind.ItemsSource  = @('全部类型','注册表 Run','启动文件夹','计划任务','服务','UWP 启动任务')
 $UI.cboRisk.ItemsSource  = @('全部风险','危险','关注','残留','正常')
 $UI.cboState.ItemsSource = @('全部状态','已启用','已禁用')
 $UI.cboKind.SelectedIndex = 0; $UI.cboRisk.SelectedIndex = 0; $UI.cboState.SelectedIndex = 0
@@ -1410,7 +1666,7 @@ function Apply-Filter {
     $st = [string]$UI.cboState.SelectedItem
     $v = $script:Items
     if ($kd -and $kd -ne '全部类型') {
-        $map = @{ '注册表 Run'='Run'; '启动文件夹'='Folder'; '计划任务'='Task'; '服务'='Service' }
+        $map = @{ '注册表 Run'='Run'; '启动文件夹'='Folder'; '计划任务'='Task'; '服务'='Service'; 'UWP 启动任务'='UWP' }
         $v = @($v | Where-Object { $_.Kind -eq $map[$kd] })
     }
     if ($rk -and $rk -ne '全部风险') { $v = @($v | Where-Object { $_.RiskText -eq $rk }) }
@@ -1776,7 +2032,7 @@ $script:SigTimer.Add_Tick({
 
 $script:EnumFns = @('Set-Progress','Resolve-Target','Expand-Path','Resolve-ExistState','Get-Sig',
                     'Get-SigText','Get-ApprovedState','Get-RiskInfo','New-Item2',
-                    'Get-ManagedServices','Get-AllStartupItems')
+                    'Get-ManagedServices','Get-UwpStartupItems','Get-AllStartupItems')
 
 $script:ENUM_BODY = @'
 $ErrorActionPreference = 'Stop'
@@ -1926,9 +2182,20 @@ function Show-Detail {
     Add-DetailLine '风险' "$($i.RiskText) — $($i.RiskNote)" $rc
     if ($i.Kind -eq 'Task' -and $i.Extra.Desc)    { Add-DetailLine '任务说明' $i.Extra.Desc }
     if ($i.Kind -eq 'Service')                    { Add-DetailLine '服务' "$($i.Extra.Display) · 账户 $($i.Extra.Account) · 当前 $($i.Extra.State)" }
+    if ($i.Kind -eq 'UWP') {
+        Add-DetailLine 'UWP 包' ([string]$i.Extra.PackageName)
+        Add-DetailLine '启动任务 ID' ([string]$i.Extra.TaskId)
+        Add-DetailLine '应用 ID' ([string]$i.Extra.ApplicationId)
+        if ([int]$i.Extra.StartupState -eq 3) { Add-DetailLine '限制' '系统策略已禁用此任务' }
+        elseif ([int]$i.Extra.StartupState -eq 4) { Add-DetailLine '限制' '系统策略已启用此任务，可能无法由用户关闭' }
+    }
     $caps = @()
-    if ($i.CanToggle) { $caps += '可启用/禁用' } else { $caps += '不支持开关（只能删除）' }
+    if ($i.Kind -eq 'UWP') { $caps += '通过 Windows 原生启动任务状态切换' }
+    elseif ($i.CanToggle) { $caps += '可启用/禁用' }
+    elseif ($i.CanDelete) { $caps += '不支持开关（可删除）' }
+    else { $caps += '不支持启用/禁用或删除' }
     if ($i.CanEdit)   { $caps += '可编辑' }      else { $caps += '不可在此编辑' }
+    if ($i.CanDelete) { $caps += '可删除' } else { $caps += '不可删除' }
     Add-DetailLine '可操作' ($caps -join ' · ')
     if ($i.AiReport) {
         $ac = switch -Wildcard ($i.AiVerdict) { '恶意*' { $P.Crit } '可疑*' { $P.Warn } '未知*' { $P.Stale } default { $P.Ok } }
@@ -2491,6 +2758,12 @@ function Get-AiItemPayload {
     if ($Item.Kind -eq 'Task') {
         $o['task_author'] = Convert-AiRedact ([string]$Item.Extra.Author) $Redact
         $o['task_desc']   = Convert-AiRedact ([string]$Item.Extra.Desc) $Redact
+    }
+    if ($Item.Kind -eq 'UWP') {
+        $o['uwp_package_name'] = Convert-AiRedact ([string]$Item.Extra.PackageName) $Redact
+        $o['uwp_package_family'] = Convert-AiRedact ([string]$Item.Extra.PackageFamilyName) $Redact
+        $o['uwp_task_id'] = Convert-AiRedact ([string]$Item.Extra.TaskId) $Redact
+        $o['uwp_application_id'] = Convert-AiRedact ([string]$Item.Extra.ApplicationId) $Redact
     }
     $o
 }
@@ -3293,9 +3566,10 @@ $UI.btnEdit.Add_Click({
     if ($sel.Count -ne 1) { Show-Msg "编辑一次只能处理一个条目（当前目标 $($sel.Count) 个）。" '提示' 'Warning'; return }
     $i = $sel[0]
     if (-not $i.CanEdit) {
-        Show-Msg ("「$($i.Label)」类型不支持在此编辑。`n`n" +
-                  "服务的可执行文件路径改起来风险高（改错会导致服务无法启动，且本工具无法可靠回滚），" +
-                  "请用 `"sc config <服务名> binPath= <新路径>`" 手工修改。") '不支持' 'Warning'
+        $why = if ($i.Kind -eq 'UWP') { 'UWP 启动任务的信息来自应用清单，不能像注册表 Run 项那样改名或改命令。' }
+               elseif ($i.Kind -eq 'Service') { '服务的可执行文件路径改起来风险高（改错会导致服务无法启动，且本工具无法可靠回滚），请用 sc config 手工修改。' }
+               else { '此类型不支持直接编辑。' }
+        Show-Msg ("「$($i.Label)」类型不支持在此编辑。`n`n$why") '不支持' 'Warning'
         return
     }
     $r = Show-ItemDialog -Mode 'edit' -Item $i
@@ -3309,21 +3583,23 @@ $UI.btnEdit.Add_Click({
 })
 
 $UI.btnToggle.Add_Click({ Invoke-Guarded {
-    $sel = Get-TargetItems
-    if ($sel.Count -eq 0) { Show-Msg '请先勾选或选中条目。' '提示' 'Warning'; return }
-    # 删除有完整清单确认，切换以前只有一行字。切换比删除更容易误触，
-    # 而且「各自取反」会把已禁用的项重新启用 —— 必须让用户看清楚清单。
-    if ($sel.Count -gt 1) {
-        $on  = @($sel | Where-Object Enabled).Count
-        $off = $sel.Count - $on
-        $note = "各自取反：当前已启用的 $on 项将被禁用，已禁用的 $off 项将被重新启用。"
-        if (-not (Show-BatchConfirm -Items $sel -Verb '切换' -Danger $false -Extra $note)) { return }
+    $selected = Get-TargetItems
+    if ($selected.Count -eq 0) { Show-Msg '请先勾选或选中条目。' '提示' 'Warning'; return }
+
+    if ($selected.Count -gt 1) {
+        $on  = @($selected | Where-Object { $_.Enabled }).Count
+        $off = $selected.Count - $on
+        $note = "本工具内切换：已启用的 $on 项将被禁用，已禁用的 $off 项将被重新启用。UWP 启动任务使用 Windows 原生 State 状态；策略锁定项会报告失败。"
+        if (-not (Show-BatchConfirm -Items $selected -Verb '切换' -Danger $false -Extra $note)) { return }
     }
+
     $ok = 0; $errs = New-Object System.Collections.Generic.List[string]
-    foreach ($i in $sel) {
-        if (-not $i.CanToggle) { $errs.Add("$($i.Name)：$($i.Label) 不支持启用/禁用开关"); continue }
-        try { Set-StartupItemEnabled -Item $i -Enabled (-not $i.Enabled); $ok++ }
-        catch { $errs.Add("$($i.Name)：$($_.Exception.Message)") }
+    foreach ($i in $selected) {
+        if (-not $i.CanToggle) { $errs.Add("$($i.Name)：$($i.Label) 不支持启用/禁用（可能受系统策略限制）"); continue }
+        try {
+            Set-StartupItemEnabled -Item $i -Enabled (-not $i.Enabled)
+            $ok++
+        } catch { $errs.Add("$($i.Name)：$($_.Exception.Message)") }
     }
     Load-Items
     $m = "已切换 $ok 项。"
@@ -3332,9 +3608,16 @@ $UI.btnToggle.Add_Click({ Invoke-Guarded {
 } '启用/禁用' })
 
 $UI.btnDel.Add_Click({ Invoke-Guarded {
-    $sel = Get-TargetItems
-    if ($sel.Count -eq 0) { Show-Msg '请先勾选条目，或在表格里选中行。' '提示' 'Warning'; return }
-    if (-not (Show-BatchConfirm -Items $sel -Verb '删除')) { return }
+    $requested = Get-TargetItems
+    if ($requested.Count -eq 0) { Show-Msg '请先勾选条目，或在表格里选中行。' '提示' 'Warning'; return }
+    $blocked = @($requested | Where-Object { -not $_.CanDelete })
+    $sel = @($requested | Where-Object { $_.CanDelete })
+    if ($sel.Count -eq 0) {
+        Show-Msg ("所选的 $($blocked.Count) 项都不支持删除。UWP 启动任务由应用清单注册，请使用启用/禁用；需要移除应用时请到 Windows 设置中卸载。") '不支持删除' 'Warning'
+        return
+    }
+    $extraWarning = if ($blocked.Count -gt 0) { "将跳过 $($blocked.Count) 项不支持删除的条目：" + (($blocked | Select-Object -ExpandProperty Name) -join '、') } else { '' }
+    if (-not (Show-BatchConfirm -Items $sel -Verb '删除' -Extra $extraWarning)) { return }
 
     # 同一次批量删除共用一个批次号，「撤销上一步」可整批还原
     $batch = if ($sel.Count -gt 1) { [guid]::NewGuid().ToString('N') } else { '' }
@@ -3349,6 +3632,7 @@ $UI.btnDel.Add_Click({ Invoke-Guarded {
     Load-Items
     $undoable = @($sel | Where-Object { Test-RecordUndoable -Action 'delete' -Kind $_.Kind -Extra $_.Extra }).Count
     $m = "已删除 $ok / $($sel.Count) 项。"
+    if ($blocked.Count -gt 0) { $m += "`n`n已跳过 $($blocked.Count) 项不支持删除的条目：" + (($blocked | Select-Object -ExpandProperty Name) -join '、') }
     if ($ok -gt 0) {
         $m += if ($undoable -eq 0) { "`n`n这些条目无法用「撤销上一步」恢复（计划任务 / 服务 / 脚本文件），需手动重建。" }
               elseif ($undoable -lt $ok) { "`n`n其中 $undoable 项可用「撤销上一步」还原，其余 $($ok - $undoable) 项需手动重建。" }
@@ -3367,6 +3651,7 @@ $UI.btnLocate.Add_Click({ Invoke-Guarded {
     $sel = Get-TargetItems
     if ($sel.Count -ne 1) { Show-Msg "「定位文件」一次只能处理一个条目（当前目标 $($sel.Count) 个）。" '提示' 'Warning'; return }
     $t = $sel[0].Target
+    if ($sel[0].Kind -eq 'UWP') { Start-Process 'ms-settings:startupapps'; return }
     if ($t -and (Test-Path -LiteralPath $t)) { Start-Process $EXPL "/select,`"$t`"" }
     else { Show-Msg "目标文件不存在：`n$t" '找不到文件' 'Warning' }
 } '定位文件' })
@@ -3384,6 +3669,7 @@ $UI.btnReg.Add_Click({ Invoke-Guarded {
         'Folder'  { Start-Process $EXPL "/select,`"$($i.Extra.File)`"" }
         'Task'    { Start-Process (Join-Path $SYS 'taskschd.msc') }
         'Service' { Start-Process (Join-Path $SYS 'services.msc') }
+        'UWP'     { Start-Process 'ms-settings:startupapps' }
     }
 } '打开位置' })
 
